@@ -35,7 +35,7 @@ object LocationParser {
     /** Synchronous parse of the raw shared text/URI (no network). */
     fun parse(text: String): SharedLocation {
         val trimmed = text.trim()
-        Log.d(TAG, "parse(): $trimmed")
+        Dbg.d(TAG) { "parse(): $trimmed" }
         // Strip trailing sentence punctuation that often clings to a shared link
         // ("...goo.gl/abc." / "(...)") so the redirect/resolve doesn't 404.
         val url = urlRegex.find(trimmed)?.value?.trimEnd('.', ',', ';', '!', '?', ')', ']', '"', '\'')
@@ -58,7 +58,7 @@ object LocationParser {
             else -> "Loading…"
         }
 
-        Log.d(TAG, "parse() → name='$name' coords=$coords short=$isShort url=$url")
+        Dbg.d(TAG) { "parse() → name='$name' coords=$coords short=$isShort url=$url" }
         return SharedLocation(
             name = name,
             lat = coords?.first,
@@ -78,7 +78,7 @@ object LocationParser {
         var coords = extractCoords(finalUrl)
         val name = extractPlaceName(finalUrl)
         if (coords == null) coords = scanBody(body)
-        Log.i(TAG, "resolve() → coords=$coords name=$name finalUrl=${finalUrl.take(120)}")
+        Dbg.i(TAG) { "resolve() → coords=$coords name=$name finalUrl=${finalUrl.take(120)}" }
         coords to name
     }
 
@@ -109,13 +109,24 @@ object LocationParser {
     private fun valid(lat: Double, lng: Double) =
         lat in -90.0..90.0 && lng in -180.0..180.0 && !(lat == 0.0 && lng == 0.0)
 
+    // Only ever fetch Google Maps / short-link hosts. A shared "location" is attacker-
+    // controlled text, and fetchFollowing() chases redirects + a consent `continue=` param —
+    // without this gate the app would issue GETs to any host the link points at (SSRF: leaking
+    // the device's network position, probing LAN hosts, acting as an open redirector).
+    private val allowedHostSuffixes = listOf("google.com", "goo.gl", "g.co", "ggpht.com")
+
+    private fun isAllowedHost(url: String): Boolean = runCatching {
+        val host = URL(url).host?.lowercase() ?: return false
+        allowedHostSuffixes.any { host == it || host.endsWith(".$it") }
+    }.getOrDefault(false)
+
     private fun scanBody(body: String): Pair<Double, Double>? {
         if (body.isBlank()) return null
         for (p in bodyPatterns) {
             val m = p.find(body) ?: continue
             val lat = m.groupValues[1].toDoubleOrNull() ?: continue
             val lng = m.groupValues[2].toDoubleOrNull() ?: continue
-            if (valid(lat, lng)) { Log.d(TAG, "scanBody matched ${p.pattern.take(24)} → $lat,$lng"); return lat to lng }
+            if (valid(lat, lng)) { Dbg.d(TAG) { "scanBody matched ${p.pattern.take(24)} → $lat,$lng" }; return lat to lng }
         }
         return null
     }
@@ -130,8 +141,14 @@ object LocationParser {
                 if (url.contains("consent.google") || url.contains("/sorry/")) {
                     Regex("continue=([^&]+)").find(url)?.groupValues?.get(1)?.let {
                         url = URLDecoder.decode(it, "UTF-8")
-                        Log.d(TAG, "consent bypass → ${url.take(100)}")
+                        Dbg.d(TAG) { "consent bypass → ${url.take(100)}" }
                     }
+                }
+                // Refuse to fetch anything outside the Maps/short-link allowlist — covers the
+                // initial URL, every redirect target, and the consent-rewritten URL above.
+                if (!isAllowedHost(url)) {
+                    Log.w(TAG, "blocked non-allowlisted host: ${url.take(80)}")
+                    return url to body
                 }
                 val conn = (URL(url).openConnection() as HttpURLConnection).apply {
                     instanceFollowRedirects = false
@@ -143,7 +160,7 @@ object LocationParser {
                 }
                 val code = conn.responseCode
                 val loc = conn.getHeaderField("Location")
-                Log.d(TAG, "hop $hop: $code ${loc?.take(90) ?: ""}")
+                Dbg.d(TAG) { "hop $hop: $code ${loc?.take(90) ?: ""}" }
                 if (code in 300..399 && !loc.isNullOrBlank()) {
                     conn.disconnect()
                     url = if (loc.startsWith("http")) loc else URL(URL(url), loc).toString()

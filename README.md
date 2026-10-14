@@ -4,13 +4,13 @@
 
 Northstar is an open-source Android app for the **Royal Enfield Himalayan 450**. It projects turn-by-turn navigation onto the bike's round **Tripper TFT dash** without cooking the phone in your tank bag.
 
-> ⚠️ Independent, community project. **Not affiliated with, endorsed by, or supported by Royal Enfield.** The dash protocol is reverse-engineered and unofficial — use at your own risk.
+> ⚠️ Independent, community project. **Not affiliated with, endorsed by, or supported by Royal Enfield.** The dash link is unofficial, so use it at your own risk. To be clear about what that means in practice: Northstar only streams a video feed to the Tripper **display** over Wi-Fi (and reads the joystick) — it never touches the ECU, engine, brakes or anything you ride with, and it can't modify the bike. The realistic worst case is the dash simply doesn't show the stream, or needs a power-cycle. It is validated on the author's firmware (**11.63**); other firmwares may behave differently.
 
 ---
 
 ## Why
 
-The official Royal Enfield app mirrors Google Maps to the dash by **screen-projection** — it keeps the phone's OLED lit and streams what's on screen. On a long ride in the sun that overheats the phone and drains the battery fast.
+Mirroring the phone screen to the dash keeps the phone's OLED lit the whole time and streams what's on screen. On a long ride in the sun that overheats the phone and drains the battery fast.
 
 Northstar takes a different approach:
 
@@ -42,13 +42,13 @@ Google Maps share ─▶ route (OSRM) ─▶ off-screen map render (Canvas)
                                               │
                                      RTP over UDP :5000
                                               ▼
-                                    Royal Enfield Tripper Dash
+                                          Tripper Dash
         (K1G control plane over UDP broadcast :2000  ·  RSA-1024 + AES-256 auth)
 ```
 
-The dash speaks an undocumented binary protocol ("K1G"): a stateful RSA/AES handshake, then it decodes an H.264/RTP stream over UDP. Northstar implements the control plane and auth in Kotlin and feeds the dash a map it renders itself — the dash doesn't care what produces the video.
+The dash speaks a binary Wi-Fi protocol ("K1G"): a stateful RSA/AES handshake, then it decodes an H.264/RTP stream over UDP. Northstar implements the link layer in Kotlin and feeds the dash a map it renders itself — the dash doesn't care what produces the video.
 
-The control-plane work builds on the excellent reverse-engineering in [**better-dash**](https://github.com/norbertFeron/better-dash) as a reference.
+The link layer uses the open-source [**better-dash**](https://github.com/norbertFeron/better-dash) project (Apache-2.0) as a reference; see [`NOTICE`](NOTICE).
 
 ---
 
@@ -66,7 +66,17 @@ The control-plane work builds on the excellent reverse-engineering in [**better-
 
 **📦 Grab the latest APK from [Releases](https://github.com/adityadasika21/NorthStar/releases/latest)** and sideload it (you'll need to allow "install unknown apps"). No account or setup required to try it.
 
-> Heads-up: it's signed with a debug key for now, so Android may show an "unverified app" warning on install — that's expected for a community build.
+Every release is signed with the same key, so new versions **update in place** — your rides and Garage data are kept (no uninstall needed). The app also **checks for new releases on launch** and offers a one-tap in-app update when one's out.
+
+> Heads-up: it's signed with a self-managed key, so Android may show an "unverified app" warning on install — that's expected for a community build.
+
+### 🔄 Get update notifications automatically (recommended)
+
+So you never miss an update, install Northstar through **[Obtainium](https://github.com/ImranR98/Obtainium)** — a free app that watches GitHub Releases and notifies you (and one-tap updates) whenever there's a new version:
+
+1. Install Obtainium.
+2. Add app → paste `https://github.com/adityadasika21/NorthStar`
+3. It tracks every release from here on — you'll get a notification each time I ship one.
 
 ---
 
@@ -95,7 +105,7 @@ The navigation core — discover, connect, stream, route, reroute, free-roam, vo
 - Move routing off the public OSRM demo server
 - Downloadable offline map regions for no-signal mountain riding
 - Per-ABI APK splits (the MapLibre native libs make the debug APK large)
-- Media now-playing overlay (pending more dash-protocol reverse engineering)
+- Media now-playing overlay (in progress)
 
 ---
 
@@ -103,7 +113,22 @@ The navigation core — discover, connect, stream, route, reroute, free-roam, vo
 
 This started as a personal project and is now open for other Himalayan / Tripper riders. **Issues, ideas, and PRs are very welcome** — especially:
 - reports of the handshake working (or not) on **other dash firmwares**,
-- packet captures of the official app for the bits still unknown (joystick-in-nav, maneuver glyph codes),
+- notes on dash behaviour for the bits still unknown (joystick-in-nav, maneuver glyph codes),
 - real-ride battery/thermal numbers with the screen off.
 
 If it helps you keep your phone cool on a ride, that's the win.
+
+---
+
+## License
+
+Licensed under the **Apache License, Version 2.0** — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
+
+The dash protocol understanding is cross-checked against the open-source
+[better-dash](https://github.com/norbertFeron/better-dash) project (also Apache-2.0); see `NOTICE`
+for attribution.
+
+**Trademarks / affiliation:** Northstar is an independent community project and is **not affiliated
+with, endorsed by, or supported by Royal Enfield**. "Royal Enfield", "Himalayan", and "Tripper" are
+trademarks of their respective owners, used here only descriptively to identify compatible hardware.
+The dash link is unofficial and exists solely for interoperability with hardware you own — use at your own risk.

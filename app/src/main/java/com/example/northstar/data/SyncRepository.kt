@@ -1,7 +1,7 @@
 package com.example.northstar.data
 
 import android.content.Context
-import android.util.Log
+import com.example.northstar.util.Dbg
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.CollectionReference
 import com.google.firebase.firestore.DocumentChange
@@ -51,8 +51,33 @@ class SyncRepository private constructor(context: Context) {
 
     private val regs = mutableListOf<ListenerRegistration>()
 
+    init {
+        // Heal any duplicate seeded maintenance items left by older upgrade paths, as soon as the
+        // store is created — even before sign-in, so the Garage is clean offline too.
+        io.launch { reconcileMaintenanceDuplicates() }
+    }
+
     private fun userDoc(): DocumentReference? =
         auth?.currentUser?.uid?.let { fs?.collection("users")?.document(it) }
+
+    /**
+     * Collapse duplicate seeded maintenance items locally and, when signed in, remove the stale
+     * Firestore docs + re-push the survivors under their canonical sids so the cloud copy can't
+     * re-sync the duplicates back. No-op once everything is canonical (so it won't churn).
+     */
+    private fun reconcileMaintenanceDuplicates() {
+        val (removed, changed) = db.dedupeMaintenance()
+        if (!changed) return
+        android.util.Log.i(TAG, "maintenance dedupe: removed ${removed.size} stale row(s), realigned names/sids")
+        val mc = userDoc()?.collection("maintenance")
+        if (mc != null) {
+            // Drop the stale docs, then re-push EVERY survivor so a name/sid realignment (not just a
+            // deletion) reaches the cloud — otherwise the next snapshot would pull the old name back.
+            removed.forEach { mc.document(it).delete() }
+            db.maintenanceItems().forEach { pushMaintenance(it) }
+        }
+        bump()
+    }
 
     // ── Reads (local) ────────────────────────────────────────────────────
     fun odometer() = db.odometer()
@@ -62,27 +87,78 @@ class SyncRepository private constructor(context: Context) {
     fun rides() = db.rides()
 
     // ── Mutations (local write-through + Firestore mirror) ────────────────
-    fun setOdometer(km: Int) { db.setOdometer(km); pushOdometer(km); bump() }
+    fun setOdometer(km: Double) { db.setOdometer(km); pushOdometer(km); bump() }
 
     fun addFuel(litres: Double, cost: Double, odoKm: Int, location: String) {
         val prevOdo = db.odometer()
         val f = FuelFillup(sid = NorthstarDb.newSid(), dateMs = System.currentTimeMillis(),
             litres = litres, cost = cost, odometerKm = odoKm, location = location)
         db.upsertFuel(f); pushFuel(f)
-        if (odoKm > prevOdo) { db.setOdometer(odoKm); pushOdometer(odoKm) }
+        if (odoKm > prevOdo) { db.setOdometer(odoKm.toDouble()); pushOdometer(odoKm.toDouble()) }
         bump()
     }
     fun deleteFuel(f: FuelFillup) { db.deleteFuelBySid(f.sid); userDoc()?.collection("fuel")?.document(f.sid)?.delete(); bump() }
 
-    fun addMaintenance(name: String, icon: String, intervalKm: Int, lastDoneOdoKm: Int) {
+    fun addMaintenance(name: String, icon: String, intervalKm: Int, lastDoneOdoKm: Int, intervalMonths: Int = 0) {
         val m = MaintenanceItem(sid = NorthstarDb.newSid(), name = name, iconKey = icon,
-            intervalKm = intervalKm, lastDoneOdoKm = lastDoneOdoKm, lastDoneDateMs = System.currentTimeMillis())
+            intervalKm = intervalKm, lastDoneOdoKm = lastDoneOdoKm, lastDoneDateMs = System.currentTimeMillis(),
+            intervalMonths = intervalMonths)
         db.upsertMaintenance(m); pushMaintenance(m); bump()
     }
-    fun markServiceDone(m: MaintenanceItem, odoKm: Int) {
-        val u = m.copy(lastDoneOdoKm = odoKm, lastDoneDateMs = System.currentTimeMillis())
-        db.upsertMaintenance(u); pushMaintenance(u); bump()
+    /**
+     * Log a service VISIT: a single event that resets the countdown on every covered
+     * maintenance item, links to a scheduled milestone if [scheduledKey] is set, and records the
+     * cost + uploaded invoice. The record's METADATA syncs (so the service history survives a
+     * reinstall / restores on a second device); the invoice FILE stays on-device, so a restored
+     * record just has no invoice attached. Scheduled services / documents remain local-only.
+     */
+    fun logVisit(
+        title: String, kind: String, scheduledKey: String, items: List<MaintenanceItem>,
+        odoKm: Int, cost: Double, invoicePath: String, note: String,
+    ) {
+        val now = System.currentTimeMillis()
+        items.forEach { m ->
+            val u = m.copy(lastDoneOdoKm = odoKm, lastDoneDateMs = now)
+            db.upsertMaintenance(u); pushMaintenance(u)
+        }
+        val rec = ServiceRecord(
+            sid = NorthstarDb.newSid(), title = title, kind = kind, scheduledKey = scheduledKey,
+            itemSids = items.map { it.sid }, odometerKm = odoKm, dateMs = now, cost = cost,
+            invoicePath = invoicePath, note = note)
+        db.upsertServiceRecord(rec); pushServiceRecord(rec)
+        bump()
     }
+
+    fun serviceRecords() = db.serviceRecords()
+    fun deleteServiceRecord(r: ServiceRecord) {
+        db.deleteServiceRecordBySid(r.sid)
+        userDoc()?.collection("services")?.document(r.sid)?.delete()
+        if (r.invoicePath.isNotBlank()) runCatching { java.io.File(r.invoicePath).delete() }
+        bump()
+    }
+
+    // ── Scheduled services ───────────────────────────────────────────────────
+    fun scheduledServices() = db.scheduledServices()
+    fun addScheduledService(label: String, targetKm: Int, targetMonths: Int) {
+        db.upsertScheduledService(ScheduledService(
+            sid = NorthstarDb.newSid(), label = label, targetKm = targetKm,
+            targetMonths = targetMonths, free = false, orderIdx = 100))
+        bump()
+    }
+    fun deleteScheduledService(s: ScheduledService) { db.deleteScheduledServiceBySid(s.sid); bump() }
+
+    // ── Documents (Glovebox) ─────────────────────────────────────────────────
+    fun documents() = db.documents()
+    fun upsertDocument(d: VehicleDocument) { db.upsertDocument(d); bump() }
+    fun deleteDocument(d: VehicleDocument) {
+        db.deleteDocumentBySid(d.sid)
+        if (d.filePath.isNotBlank()) runCatching { java.io.File(d.filePath).delete() }
+        bump()
+    }
+
+    // ── Bike identity ─────────────────────────────────────────────────────────
+    fun bikeIdentity() = db.bikeIdentity()
+    fun setBikeIdentity(b: BikeIdentity) { db.setBikeIdentity(b); bump() }
     fun deleteMaintenance(m: MaintenanceItem) { db.deleteMaintenanceBySid(m.sid); userDoc()?.collection("maintenance")?.document(m.sid)?.delete(); bump() }
 
     fun addSaved(name: String, lat: Double, lng: Double, note: String) {
@@ -94,12 +170,22 @@ class SyncRepository private constructor(context: Context) {
     }
     fun deleteSaved(s: SavedLocation) { db.deleteSavedBySid(s.sid); userDoc()?.collection("saved")?.document(s.sid)?.delete(); bump() }
 
-    /** Persist a finished ride (local + cloud). */
-    fun addRide(r: Ride) { db.upsertRide(r); pushRide(r); bump() }
+    /**
+     * Persist a finished ride (local + cloud). Self-scopes on the repo's own IO scope so the
+     * write survives even when called from ViewModel teardown (onCleared cancels viewModelScope
+     * before a launch there could run — that was silently dropping rides).
+     */
+    fun addRide(r: Ride) { io.launch {
+        db.upsertRide(r); pushRide(r)
+        // A completed ride advances the bike's odometer by exactly what was ridden.
+        db.addToOdometer(r.distanceKm)
+        val newOdo = db.odometer(); pushOdometer(newOdo)
+        bump()
+    } }
     fun deleteRide(r: Ride) { db.deleteRideBySid(r.sid); userDoc()?.collection("rides")?.document(r.sid)?.delete(); bump() }
 
     // ── Firestore push helpers ───────────────────────────────────────────
-    private fun pushOdometer(km: Int) { userDoc()?.collection("state")?.document("bike")?.set(mapOf("odometerKm" to km)) }
+    private fun pushOdometer(km: Double) { userDoc()?.collection("state")?.document("bike")?.set(mapOf("odometerKm" to km)) }
     private fun pushFuel(f: FuelFillup) {
         userDoc()?.collection("fuel")?.document(f.sid)?.set(
             mapOf("dateMs" to f.dateMs, "litres" to f.litres, "cost" to f.cost, "odometerKm" to f.odometerKm, "location" to f.location))
@@ -107,7 +193,15 @@ class SyncRepository private constructor(context: Context) {
     private fun pushMaintenance(m: MaintenanceItem) {
         userDoc()?.collection("maintenance")?.document(m.sid)?.set(
             mapOf("name" to m.name, "iconKey" to m.iconKey, "intervalKm" to m.intervalKm,
-                "lastDoneOdoKm" to m.lastDoneOdoKm, "lastDoneDateMs" to m.lastDoneDateMs))
+                "lastDoneOdoKm" to m.lastDoneOdoKm, "lastDoneDateMs" to m.lastDoneDateMs,
+                "intervalMonths" to m.intervalMonths))
+    }
+    private fun pushServiceRecord(r: ServiceRecord) {
+        // Metadata only — the invoice file is device-local and isn't uploaded.
+        userDoc()?.collection("services")?.document(r.sid)?.set(
+            mapOf("title" to r.title, "kind" to r.kind, "scheduledKey" to r.scheduledKey,
+                "itemSids" to r.itemSids, "odometerKm" to r.odometerKm, "dateMs" to r.dateMs,
+                "cost" to r.cost, "note" to r.note))
     }
     private fun pushSaved(s: SavedLocation) {
         userDoc()?.collection("saved")?.document(s.sid)?.set(
@@ -125,7 +219,7 @@ class SyncRepository private constructor(context: Context) {
     fun startSync() {
         val u = userDoc() ?: return
         stopSync()
-        Log.i(TAG, "startSync for uid=${auth?.currentUser?.uid}")
+        Dbg.i(TAG) { "startSync for uid=${auth?.currentUser?.uid}" }
 
         listen(u.collection("fuel"),
             uploadLocal = { db.fuelFills().forEach { pushFuel(it) } },
@@ -140,8 +234,12 @@ class SyncRepository private constructor(context: Context) {
             apply = { doc -> db.upsertMaintenance(MaintenanceItem(
                 sid = doc.id, name = doc.getString("name") ?: "", iconKey = doc.getString("iconKey") ?: "wrench",
                 intervalKm = (doc.getLong("intervalKm") ?: 0L).toInt(), lastDoneOdoKm = (doc.getLong("lastDoneOdoKm") ?: 0L).toInt(),
-                lastDoneDateMs = doc.getLong("lastDoneDateMs") ?: 0L)) },
-            remove = { db.deleteMaintenanceBySid(it) })
+                lastDoneDateMs = doc.getLong("lastDoneDateMs") ?: 0L,
+                intervalMonths = (doc.getLong("intervalMonths") ?: 0L).toInt())) },
+            remove = { db.deleteMaintenanceBySid(it) },
+            // A remote pull can re-introduce a duplicate (old random-sid doc alongside the seed
+            // sid) — collapse it again and clean the cloud so it converges instead of ping-ponging.
+            afterApply = { reconcileMaintenanceDuplicates() })
 
         listen(u.collection("saved"),
             uploadLocal = { db.savedLocations().forEach { pushSaved(it) } },
@@ -162,10 +260,26 @@ class SyncRepository private constructor(context: Context) {
                 endLat = doc.getDouble("endLat") ?: 0.0, endLng = doc.getDouble("endLng") ?: 0.0)) },
             remove = { db.deleteRideBySid(it) })
 
+        listen(u.collection("services"),
+            uploadLocal = { db.serviceRecords().forEach { pushServiceRecord(it) } },
+            apply = { doc ->
+                @Suppress("UNCHECKED_CAST")
+                val itemSids = (doc.get("itemSids") as? List<String>) ?: emptyList()
+                // Keep a local invoice file if this device already has the record; a freshly
+                // restored record (other device / reinstall) simply has no invoice attached.
+                val localInvoice = db.serviceRecords().firstOrNull { it.sid == doc.id }?.invoicePath ?: ""
+                db.upsertServiceRecord(ServiceRecord(
+                    sid = doc.id, title = doc.getString("title") ?: "",
+                    kind = doc.getString("kind") ?: "company", scheduledKey = doc.getString("scheduledKey") ?: "",
+                    itemSids = itemSids, odometerKm = (doc.getLong("odometerKm") ?: 0L).toInt(),
+                    dateMs = doc.getLong("dateMs") ?: 0L, cost = doc.getDouble("cost") ?: 0.0,
+                    invoicePath = localInvoice, note = doc.getString("note") ?: "")) },
+            remove = { db.deleteServiceRecordBySid(it) })
+
         // Odometer: single doc. Pull if present, else seed the cloud from local.
         regs += u.collection("state").document("bike").addSnapshotListener { snap, _ ->
             io.launch {
-                val km = snap?.getLong("odometerKm")?.toInt()
+                val km = snap?.getDouble("odometerKm")
                 if (km != null) { db.setOdometer(km); bump() } else pushOdometer(db.odometer())
             }
         }
@@ -178,6 +292,7 @@ class SyncRepository private constructor(context: Context) {
         uploadLocal: () -> Unit,
         apply: (DocumentSnapshot) -> Unit,
         remove: (String) -> Unit,
+        afterApply: () -> Unit = {},
     ) {
         // One-time: if the cloud copy is empty, push our local rows up to seed it.
         col.get().addOnSuccessListener { qs -> if (qs.isEmpty) io.launch { uploadLocal() } }
@@ -190,7 +305,7 @@ class SyncRepository private constructor(context: Context) {
                         DocumentChange.Type.REMOVED -> remove(ch.document.id)
                     }
                 }
-                if (snap.documentChanges.isNotEmpty()) bump()
+                if (snap.documentChanges.isNotEmpty()) { afterApply(); bump() }
             }
         }
     }

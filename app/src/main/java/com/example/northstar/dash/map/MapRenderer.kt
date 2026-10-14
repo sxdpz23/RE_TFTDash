@@ -40,6 +40,8 @@ class MapRenderer(private val tiles: TileProvider) {
         val tilt3d: Boolean = false,       // perspective 3D view (nav heading-up only)
         val etaPrimary: String? = null,    // big glance value, e.g. "24 min" (nav only)
         val etaSecondary: String? = null,  // smaller line, e.g. "18 km · 13:32"
+        val gpsWeak: Boolean = false,      // imprecise/slow fix → amber marker + "GPS weak" pill
+        val gpsLost: Boolean = false,      // no fresh fix → grey marker + "GPS lost" pill
     )
 
     private val bgColor   = Color.rgb(229, 227, 223) // Google Maps land colour, behind missing tiles
@@ -71,12 +73,16 @@ class MapRenderer(private val tiles: TileProvider) {
     private val etaBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(46, 255, 255, 255); style = Paint.Style.STROKE; strokeWidth = 1.5f }
     private val etaBigPaint    = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(126, 217, 87); textSize = 20f; isFakeBoldText = true; textAlign = Paint.Align.CENTER }   // Google-nav green
     private val etaSmallPaint  = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(196, 201, 208); textSize = 12f; textAlign = Paint.Align.CENTER }
+    // GPS-health pill (top-centre, shown only when the signal is weak/lost)
+    private val gpsPillText    = Paint(Paint.ANTI_ALIAS_FLAG).apply { textSize = 13f; isFakeBoldText = true; textAlign = Paint.Align.CENTER }
 
     // Reused across frames
     private val routePath = Path()
     private val riderPath = Path()
     private val tmpRect = RectF()
     private val pillRect = RectF()
+    private val tileSrc = Rect()      // sub-region of an ancestor tile when scaling up
+    private val childDst = RectF()    // quadrant target when scaling children down
     private val textBounds = Rect()
     private val tiltMatrix = Matrix()
     private val tiltSrc = FloatArray(8)
@@ -132,11 +138,10 @@ class MapRenderer(private val tiles: TileProvider) {
         val txMax = Math.floorDiv((left + w + pad).toInt(), ts)
         val tyMax = Math.floorDiv((top + h + pad).toInt(), ts)
         for (tx in txMin..txMax) for (ty in tyMin..tyMax) {
-            val bmp = tiles.get(f.zoom, tx, ty) ?: continue
             val dstL = (tx * ts - left).toFloat()
             val dstT = (ty * ts - top).toFloat()
             tmpRect.set(dstL, dstT, dstL + ts, dstT + ts)
-            canvas.drawBitmap(bmp, null, tmpRect, tilePaint)
+            drawTileBestEffort(canvas, f.zoom, tx, ty, tmpRect)
         }
 
         // ── Road route polyline ──
@@ -157,12 +162,18 @@ class MapRenderer(private val tiles: TileProvider) {
             dotPaint.color = Color.WHITE; canvas.drawCircle(dx, dy, 3.5f, dotPaint)
         }
 
-        // ── Rider marker (Google blue) ──
+        // ── Rider marker — colour tracks GPS health (blue good, amber weak, grey lost) ──
         if (f.riderLat != null && f.riderLng != null) {
             val rx = sx(f.riderLng); val ry = sy(f.riderLat)
-            dotPaint.color = Color.argb(60, 66, 133, 244); canvas.drawCircle(rx, ry, 17f, dotPaint)
+            val markerColor = when {
+                f.gpsLost -> Color.rgb(150, 154, 160)  // grey: position is stale
+                f.gpsWeak -> Color.rgb(251, 188, 5)    // amber: imprecise
+                else      -> routeBlue                  // blue: good
+            }
+            val haloColor = Color.argb(60, Color.red(markerColor), Color.green(markerColor), Color.blue(markerColor))
+            dotPaint.color = haloColor; canvas.drawCircle(rx, ry, 17f, dotPaint)
             if (rotate) {
-                // Heading-up: blue chevron pointing up (travel direction)
+                // Heading-up: chevron pointing up (travel direction)
                 riderPath.reset()
                 riderPath.moveTo(rx, ry - 11f)
                 riderPath.lineTo(rx - 7f, ry + 7f)
@@ -170,11 +181,11 @@ class MapRenderer(private val tiles: TileProvider) {
                 riderPath.close()
                 canvas.save(); canvas.rotate(f.heading, rx, ry)
                 dotPaint.color = Color.WHITE; canvas.drawCircle(rx, ry, 9f, dotPaint)
-                dotPaint.color = routeBlue; canvas.drawPath(riderPath, dotPaint)
+                dotPaint.color = markerColor; canvas.drawPath(riderPath, dotPaint)
                 canvas.restore()
             } else {
                 dotPaint.color = Color.WHITE; canvas.drawCircle(rx, ry, 8f, dotPaint)
-                dotPaint.color = routeBlue; canvas.drawCircle(rx, ry, 5.5f, dotPaint)
+                dotPaint.color = markerColor; canvas.drawCircle(rx, ry, 5.5f, dotPaint)
             }
         }
 
@@ -208,6 +219,25 @@ class MapRenderer(private val tiles: TileProvider) {
             }
         }
 
+        // ── GPS-health pill (top-centre safe zone) — only when degraded, so the rider knows the
+        // marker is imprecise/held rather than wondering why the map stopped tracking ──
+        if (f.gpsLost || f.gpsWeak) {
+            val label = if (f.gpsLost) "GPS lost" else "GPS weak"
+            gpsPillText.color = if (f.gpsLost) googleRed else Color.rgb(251, 188, 5)
+            val padH = 14f; val padV = 6f
+            val fm = gpsPillText.fontMetrics
+            val textH = fm.descent - fm.ascent
+            val pillW = gpsPillText.measureText(label) + padH * 2
+            val cxp = w / 2f
+            val top = 14f
+            val bottom = top + padV * 2 + textH
+            pillRect.set(cxp - pillW / 2f, top, cxp + pillW / 2f, bottom)
+            val r = (bottom - top) / 2f
+            canvas.drawRoundRect(pillRect, r, r, etaBgPaint)
+            canvas.drawRoundRect(pillRect, r, r, etaBorderPaint)
+            canvas.drawText(label, cxp, top + padV - fm.ascent, gpsPillText)
+        }
+
         // No other on-map text overlays — the dash's own widgets show name/turn, and the
         // round bezel clips anything near the top edge.
 
@@ -217,5 +247,46 @@ class MapRenderer(private val tiles: TileProvider) {
             standbyPaint.getTextBounds(msg, 0, msg.length, textBounds)
             canvas.drawText(msg, (w - textBounds.width()) / 2f, h / 2f, standbyPaint)
         }
+    }
+
+    /**
+     * Draws one map tile, never leaving a blank cell on a cache miss. Slippy-map trick:
+     * 1. exact tile if cached (also kicks off the async load);
+     * 2. else scale UP the matching sub-region of a cached lower-zoom ancestor — the level
+     *    we just left is still in memory, so a zoom-IN renders instantly and only sharpens
+     *    once the real tile arrives (no blank flash, which is what made zoom feel slow);
+     * 3. else scale DOWN the four cached higher-zoom children into quadrants (zoom-OUT case).
+     */
+    private fun drawTileBestEffort(canvas: Canvas, z: Int, tx: Int, ty: Int, dst: RectF) {
+        tiles.get(z, tx, ty)?.let { canvas.drawBitmap(it, null, dst, tilePaint); return }
+
+        var up = 1
+        while (up <= 4 && z - up >= 0) {
+            val anc = tiles.getCached(z - up, tx shr up, ty shr up)
+            if (anc != null) {
+                val cells = 1 shl up
+                // Sub-region in the bitmap's OWN pixel space (512 px for hi-DPI tiles, 256 for any
+                // legacy tile) — not the logical TILE_SIZE, or it would sample the wrong quadrant.
+                val sub = anc.width / cells
+                val sxOff = (tx and (cells - 1)) * sub
+                val syOff = (ty and (cells - 1)) * sub
+                tileSrc.set(sxOff, syOff, sxOff + sub, syOff + sub)
+                canvas.drawBitmap(anc, tileSrc, dst, tilePaint)
+                return
+            }
+            up++
+        }
+
+        val halfW = (dst.right - dst.left) / 2f
+        val halfH = (dst.bottom - dst.top) / 2f
+        for (qx in 0..1) for (qy in 0..1) {
+            val child = tiles.getCached(z + 1, tx * 2 + qx, ty * 2 + qy) ?: continue
+            childDst.set(
+                dst.left + qx * halfW, dst.top + qy * halfH,
+                dst.left + qx * halfW + halfW, dst.top + qy * halfH + halfH,
+            )
+            canvas.drawBitmap(child, null, childDst, tilePaint)
+        }
+        // Deep miss across all levels → the land-colour bg shows through (rare).
     }
 }

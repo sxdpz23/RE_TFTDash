@@ -16,7 +16,6 @@ import com.example.northstar.dash.map.MapRenderer
 import com.example.northstar.dash.map.Mercator
 import com.example.northstar.dash.map.TileProvider
 import com.example.northstar.dash.nav.GeoPoint
-import com.example.northstar.dash.nav.NavEngine
 import com.example.northstar.dash.nav.Route
 import com.example.northstar.dash.nav.Router
 import com.example.northstar.dash.protocol.DashCommands
@@ -30,6 +29,14 @@ import kotlinx.coroutines.flow.update
 
 enum class ConnStage { OFFLINE, WIFI, AUTH, STREAMING, ERROR }
 
+/**
+ * GPS health shown to the rider so a bad signal degrades *visibly* instead of the marker just
+ * freezing. GOOD = fresh, accurate. WEAK = fresh but imprecise (or fixes coming slowly) → the
+ * map eases gently toward truth, no jitter. LOST = no fresh fix for a few seconds → marker holds
+ * its last known spot and the dash says so.
+ */
+enum class GpsStatus { GOOD, WEAK, LOST }
+
 data class DashUiState(
     val stage: ConnStage = ConnStage.OFFLINE,
     val frameCount: Int = 0,
@@ -38,16 +45,21 @@ data class DashUiState(
     val wifiPassword: String = "12345678",  // RE Tripper factory passphrase; rider-overridable
     val destinationName: String? = null,
     val errorMessage: String? = null,
+    val retryAttempt: Int = 0,        // >0 while auto-retrying the flaky auth handshake
     val mapZoom: Int = 19,
     val remainingKm: Double? = null,
     val etaMinutes: Int? = null,
     val maneuver: String? = null,
     val hasGps: Boolean = false,
+    val gpsStatus: GpsStatus = GpsStatus.LOST,
     val hasRoute: Boolean = false,
     val offRoute: Boolean = false,
+    val recalculating: Boolean = false, // off-route long enough / actively rerouting → ETA frozen, pill shows "Recalculating"
     val headingUp: Boolean = true,
     val followMode: Boolean = true,
     val thermal: String = "OK",
+    val needsWifiOn: Boolean = false,   // Wi‑Fi radio is off → UI prompts to enable it
+    val needsLocationOn: Boolean = false, // Location services (master toggle) off → can't resolve dash SSID for auth
     // For the in-app Google Map view
     val riderLat: Double? = null,
     val riderLng: Double? = null,
@@ -60,6 +72,13 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
     private val _ui = MutableStateFlow(DashUiState())
     val ui = _ui.asStateFlow()
 
+    // The EXACT frame being H.264-encoded to the dash, published for the in-app "Dash view"
+    // so the phone preview is pixel-identical to the bike screen (same renderer, not a second
+    // map engine). A fresh immutable snapshot per redraw — the encoder's own bitmap is mutated
+    // on a background thread and recycled on teardown, so handing that out would tear/crash.
+    private val _previewFrame = MutableStateFlow<Bitmap?>(null)
+    val previewFrame = _previewFrame.asStateFlow()
+
     private val session     = DashSession(viewModelScope)
     private val wifiManager = DashWifiManager(app, viewModelScope)
     private val dashConfig  = com.example.northstar.dash.DashConfig.get(app)
@@ -70,12 +89,28 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
     private val tiles       = TileProvider(app, viewModelScope)
     private val location    = LocationTracker(app)
     private val mapRenderer = MapRenderer(tiles)
+    private val mediaInfo   = com.example.northstar.media.MediaInfoProvider(app)
+    private val callController = com.example.northstar.media.CallController(app)
+    private var mediaObserveJob: Job? = null
     private val powerManager = app.getSystemService(Application.POWER_SERVICE) as PowerManager
 
     private var encoder: DashEncoder? = null
     private var streamJob: Job? = null
+    // Even presentation clock (ms) feeding the RTP 90 kHz timestamp — advances by exactly one
+    // frame interval per encoded frame so the dash gets an evenly-spaced timeline (NOT wall clock,
+    // which inherited the loop's jitter). Paired with absolute-grid send pacing below.
+    @Volatile private var videoPtsMs = 0L
+    private var sendPaceMs = 0.0    // EMA of the real frame-send interval — exposes cadence jitter
+    private var sendPaceMaxMs = 0L  // worst interval since the last diag line
+    // Backstop so a dropped/never-reached connection can't drain the battery forever: if we don't
+    // reach STREAMING within this window, give up completely (stop the Wi‑Fi reconnect loop, the
+    // foreground service, GPS and the encoder). Cancelled the moment streaming starts.
+    private var giveupJob: Job? = null
+    private var connLostAlertJob: Job? = null
+    private var connLostAlerted = false
 
     private var userWantsConnection = false
+    private var authAttempts = 0       // bounded auto-retry of the (flaky) auth handshake
 
     // ── Navigation/map state read by the 4 fps frame loop ──
     @Volatile private var destLat: Double? = null
@@ -104,24 +139,42 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
     private var fixSpeed = 0f             // m/s
     private var fixWallMs = 0L
     private var lastFixTime = 0L
+    private var gpsFixIntervalMs = 0.0   // EMA of the gap between fixes — exposes screen-off GPS throttling
+
+    // GPS health surfaced to the dash + phone (computed each tick from accuracy + fix age).
+    @Volatile private var gpsStatus = GpsStatus.LOST
+    // Held marker position while stationary — deadbands sub-accuracy GPS wander so a parked bike's
+    // dot doesn't drift/jitter. Updated to the live fix while moving; reset on teardown.
+    private var heldRider: Pair<Double, Double>? = null
 
     // Smoothed rider position shown on the dash frame (locked to the camera centre so the
     // marker stays put and the map slides under it). null = no GPS.
     @Volatile private var frameRiderLat: Double? = null
     @Volatile private var frameRiderLng: Double? = null
-    @Volatile private var camMoving = false   // drives the dynamic frame rate
 
     // Stable ETA (Google-like): the raw estimate jitters with instantaneous speed, so we
     // smooth it and only recompute the absolute arrival clock occasionally — no per-frame churn.
     private var smoothEtaSec = 0.0
     @Volatile private var etaArrivalMs = 0L
     private var lastArrivalCalcMs = 0L
+    // The minutes-remaining shown to the rider, refreshed on the same 5 s cadence as the arrival
+    // clock so it stops ticking/bouncing every second ("tacky ETA"). null = no active ETA.
+    @Volatile private var displayedEtaMin: Int? = null
 
     // Off-route → reroute, debounced. Now feasible because the app keeps cellular
     // internet while bound to the dash (per-socket binding), so Router can run mid-ride.
     @Volatile private var offRouteSince = 0L
     @Volatile private var lastRerouteAt = 0L
     @Volatile private var rerouting = false
+    // Debounce for the "Recalculating" state (ignore 1-frame off-route GPS blips).
+    @Volatile private var offRouteStreakStart = 0L
+    // Keep "Recalculating" on screen a beat after it clears, so a fast reroute is still seen.
+    @Volatile private var recalcHoldUntil = 0L
+    // Last lateral distance from the route (m) — logged so flyover/off-route thresholds are tunable.
+    @Volatile private var lastSnapDist = -1.0
+    // Rolling average of actual moving speed (m/s), held through stops — drives a STEADY ETA
+    // instead of one that swings with instantaneous speed at every brake/light.
+    private var smoothSpeedMps = 0.0
 
     // Map-matched rider position: snapped onto the route while on it (kills the GPS
     // lane/road jitter), raw GPS when genuinely off-route. Drives the marker + camera.
@@ -133,12 +186,71 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
     private var lastSignature = ""
     private var lastRedrawAt = 0L
 
+    // Ride diagnostics: one-shot "first frame" marker + a throttle for the periodic ride line.
+    @Volatile private var loggedFirstFrame = false
+    private var lastDiagMs = 0L
+
     companion object {
         private const val MANUAL_IDLE_MS = 8_000L
         private const val FORCE_REDRAW_MS = 2_000L
-        private const val SMOOTH_TAU = 0.28      // camera smoothing time constant (s)
-        private const val FPS_MOVING = 24        // buttery while riding
-        private const val FPS_IDLE = 7           // throttle when stopped (saves power)
+        // How long to keep trying to (re)connect before giving up and freeing all background
+        // resources. Covers the flaky initial handshake AND a mid-ride drop; if the dash is truly
+        // gone (parked / powered off / out of range) we stop draining instead of retrying forever.
+        // 2 min (was 45 s): if the dash AP hangs mid-ride it only comes back after a bike power-cycle,
+        // and 45 s wasn't enough to safely pull over + restart before Northstar gave up. With the
+        // WiFi layer now retrying through an AP-missing window, this keeps trying long enough that a
+        // power-cycle auto-rejoins with no manual step. Still bounded so a truly-gone dash frees power.
+        private const val RECONNECT_GIVEUP_MS = 120_000L
+        // Alert the rider after this long of sustained (non-transient) link loss — long enough to skip
+        // a brief blip that auto-recovers, short enough that they're not riding blind for minutes.
+        private const val CONN_LOST_ALERT_MS = 12_000L
+        private const val SMOOTH_TAU = 0.20      // camera smoothing time constant (s) — tighter so the map trails the bike less
+        // GPS bearing is only meaningful while genuinely moving; below this it's noise that
+        // would spin the heading-up map (the "turns to the opposite direction when I stop" bug).
+        private const val BEARING_MIN_SPEED = 2.0f   // m/s (~7 km/h)
+        // Lead the displayed position by the pipeline latency (camera ease + H.264 encode + RTP +
+        // dash decode/display ≈ 0.5 s) so the dash shows where the bike IS, not where it was.
+        private const val DISPLAY_LEAD_S = 0.4
+        // Cap on how far ahead the constant-velocity predictor projects (s of travel). Bounds the
+        // over-shoot if a fix is missed across a real stop / a long dropout; below this it tracks
+        // the rider's actual motion so the camera never freezes between sparse (screen-off) fixes.
+        private const val MAX_PREDICT_S = 3.0
+        // Motion-adaptive frame cadence — the heart of the RE-style power/stability model.
+        // Measuringthe dash showed it projects the map at just 2–4 fps with two
+        // profiles (q2g: 4 fps/200 kbps "frameToSend"=250 ms, and 2 fps/100 kbps =500 ms) and switches
+        // between them. RE gates on battery; we gate on MOTION instead (smarter for our screen-off
+        // power goal, and the user explicitly didn't want a battery gate): stream the fast profile
+        // while the map is actually changing (driving / panning / zooming), drop to the slow profile
+        // when it's static. A few fps is plenty for a map AND never overruns the dash decoder — which
+        // is what caused the blink/stutter at our old fixed 24 fps. ACTIVE is the knob to raise if
+        // joystick panning feels choppy (at the cost of more decoder load).
+        // ACTIVE was 250 ms (4 fps, matched) but that 250 ms quantum IS the ~0.25 s position lag
+        // ("catch-up") felt while moving. Raised to 100 ms (10 fps) — comfortably under the 12 fps the
+        // field log proved stable on this dash, so position tracks ~2.5× tighter with no overrun risk.
+        // IDLE stays low: a static map has no lag to fix and 2 fps saves power.
+        // Back to 4 fps to MATCH the dash exactly (measured at ~3.7 fps). The
+        // 12 fps experiment was smoother but ~3× the 2.4 GHz WiFi load, which stresses the dash AP and
+        // its BT coexistence; 4 fps is the proven-stable envelope the dash decoder never overruns.
+        private const val FRAME_MS_ACTIVE = 250L   // 4 fps while moving — matched
+        private const val FRAME_MS_IDLE   = 500L   // 2 fps when static — RE low profile
+        // Stay on the fast profile this long after the last visible change, so brief pauses (e.g.
+        // between joystick nudges, or a GPS fix gap) don't flap the cadence back and forth.
+        private const val MOTION_HOLD_MS  = 1_500L
+        private const val MAX_AUTH_ATTEMPTS = 4   // the fw 11.63 handshake often needs a couple of tries
+        // Dash joystick codes for call control while a call card is showing. UP = answer, DOWN =
+        // reject (intuitive accept/decline; verified on the bike that UP is the natural answer press,
+        // not IN). The HOME button is left alone — it does the dash's own exit-to-home.
+        private const val BTN_ANSWER = 0x06       // joystick UP
+        private const val BTN_REJECT = 0x07       // joystick DOWN
+        // MAP-mode joystick codes (the dash forwards these directly while projecting, no media-control
+        // mode needed) — confirmed in the ride log: 0x13/0x14 with callRinging=false during the map.
+        // These give DIRECT zoom like the dash. In/out guess; swap if the ride feels wrong.
+        private const val BTN_MAP_ZOOM_IN  = 0x14
+        private const val BTN_MAP_ZOOM_OUT = 0x13
+        // MEDIA-mode codes (after pressing IN to enter the dash's audio controls): L/R skip tracks on
+        // the phone's player, NOT map zoom. Map zoom stays on the direct map-mode codes above.
+        private const val BTN_MEDIA_NEXT = 0x09   // media-mode RIGHT → next track
+        private const val BTN_MEDIA_PREV = 0x0A   // media-mode LEFT  → previous track
     }
 
     /** Project a lat/lng forward [distM] metres along [bearingDeg] (great-circle). */
@@ -155,19 +267,39 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
         return Math.toDegrees(lat2) to Math.toDegrees(lng2)
     }
 
+    /**
+     * Distance (m) to dead-reckon ahead of the last GPS fix, given the time since it arrived.
+     *
+     * CONSTANT velocity (distance = speed × time), capped at [MAX_PREDICT_S]. The old version
+     * tapered off after ~1 s, so the camera DECELERATED to a near-stop between fixes and then
+     * jumped when the next one landed — the "stuck then teleport" feel, especially with the screen
+     * off when GPS callbacks slow to multi-second gaps. Projecting at the true speed keeps the
+     * camera (and the constant [DISPLAY_LEAD_S] lead) moving smoothly through the gap, so each new
+     * fix lands where the camera already is — no jump. The cap bounds over-shoot if the rider
+     * stops/turns mid-gap; the next fix (with speed ~0 → predictor off) then eases it back.
+     */
+    private fun predictedDistance(speedMps: Float, elapsedSec: Double): Double =
+        speedMps * elapsedSec.coerceIn(0.0, MAX_PREDICT_S)
+
     init {
         // Reflect the rider's stored dash WiFi config (SSID may be blank until discovered).
-        _ui.value = _ui.value.copy(ssid = dashConfig.ssid, wifiPassword = dashConfig.password)
+        _ui.update { it.copy(ssid = dashConfig.ssid, wifiPassword = dashConfig.password) }
 
         // When we connect to a previously-unknown dash by prefix, learn + persist its exact
         // SSID so subsequent connects target it directly (no system picker again).
         wifiManager.onSsidResolved = { learned ->
             dashConfig.ssid = learned
-            _ui.value = _ui.value.copy(ssid = learned)
+            _ui.update { it.copy(ssid = learned) }
         }
 
         viewModelScope.launch {
             wifiManager.state.collect { ws ->
+                com.example.northstar.data.RideDiagnostics.log(
+                    "wifi",
+                    ws.status.toString() +
+                        (ws.ssid.takeIf { it.isNotBlank() }?.let { " ssid=$it" } ?: "") +
+                        (ws.error?.let { " err=$it" } ?: ""),
+                )
                 when (ws.status) {
                     WifiConnStatus.CONNECTED -> {
                         refreshStage()
@@ -181,7 +313,20 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
                             ) session.connect(_ui.value.ssid, wifiManager.network)
                         }
                     }
-                    WifiConnStatus.ERROR -> { _ui.value = _ui.value.copy(errorMessage = ws.error); refreshStage() }
+                    WifiConnStatus.ERROR -> {
+                        // Dash is gone for good (bike powered off / out of range) → the ride is
+                        // over. Save it even though the user never tapped Disconnect.
+                        stopRecording()
+                        // …and release everything connect() acquired (wake/wifi locks, GPS,
+                        // encoder loop). These used to leak when a connection ENDED on failure
+                        // rather than via the Disconnect button, draining the battery in the
+                        // background until the app was force-closed.
+                        userWantsConnection = false
+                        releaseBackgroundResources()
+                        session.disconnect()   // wifi status stays ERROR → stage remains ERROR
+                        _ui.update { it.copy(errorMessage = ws.error) }; refreshStage()
+                        com.example.northstar.data.RideDiagnostics.stop("wifi error / dash gone")
+                    }
                     else -> refreshStage()
                 }
             }
@@ -189,22 +334,79 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
 
         viewModelScope.launch {
             session.state.collect { state ->
+                com.example.northstar.data.RideDiagnostics.log("session", "→ $state")
                 refreshStage()
-                if (state == DashState.READY) startStream()
+                // Battery backstop: count down to a full give-up unless/until we're actually
+                // streaming. Reaching STREAMING cancels it; any non-streaming state (re)arms it.
+                if (state == DashState.STREAMING) { cancelReconnectGiveup(); cancelConnLostAlert() }
+                else if (userWantsConnection) { armReconnectGiveup(); armConnLostAlert() }
+                when (state) {
+                    DashState.READY -> { authAttempts = 0; _ui.update { it.copy(retryAttempt = 0) }; startStream() }
+                    DashState.STREAMING -> {
+                        authAttempts = 0; _ui.update { it.copy(retryAttempt = 0, errorMessage = null) }
+                        // Usage: the dash actually started showing the map — the core feature working.
+                        com.example.northstar.util.Telemetry.logEvent("dash_streaming")
+                    }
+                    // The handshake to fw 11.63 is flaky — a single failed attempt is normal.
+                    // Auto-retry (WiFi is already up) instead of making the rider re-tap Connect.
+                    DashState.ERROR -> {
+                        if (userWantsConnection &&
+                            wifiManager.state.value.status == WifiConnStatus.CONNECTED &&
+                            authAttempts < MAX_AUTH_ATTEMPTS
+                        ) {
+                            authAttempts++
+                            _ui.update { it.copy(retryAttempt = authAttempts, errorMessage = null) }
+                            delay(1_500)
+                            if (userWantsConnection && wifiManager.state.value.status == WifiConnStatus.CONNECTED)
+                                session.connect(_ui.value.ssid, wifiManager.network)
+                        } else {
+                            _ui.update { it.copy(retryAttempt = 0) }
+                            // Retries exhausted while the WiFi link is still up → give up fully now
+                            // (don't wait out the timer). giveUp() also stops the Wi‑Fi reconnect loop.
+                            if (userWantsConnection && authAttempts >= MAX_AUTH_ATTEMPTS &&
+                                wifiManager.state.value.status == WifiConnStatus.CONNECTED
+                            ) {
+                                giveUp("auth exhausted after $authAttempts attempts")
+                            }
+                        }
+                    }
+                    else -> {}
+                }
             }
         }
 
-        session.onError = { msg -> _ui.value = _ui.value.copy(errorMessage = msg); refreshStage() }
-        // Joystick → map zoom only. RIGHT (0x09) = zoom in, LEFT (0x0A) = zoom out.
-        // No exit gesture, no other map control (media section is for media).
+        session.onError = { msg ->
+            com.example.northstar.data.RideDiagnostics.log("error", msg)
+            _ui.update { it.copy(errorMessage = msg) }; refreshStage()
+        }
+        // Joystick handling. While a call card is on the dash, the joystick answers/rejects the call
+        // (IN = answer, DOWN = reject) instead of zooming; otherwise RIGHT/LEFT zoom the map. The
+        // separate HOME button is intentionally untouched — it does the dash's native exit; its code
+        // just falls through to the logged-else branch. Codes verified fw 11.63: IN=0x18, RIGHT=0x09,
+        // LEFT=0x0A, DOWN=0x07. Every unmatched code is shown in ui.lastButton so we can retune.
         session.onButton = { btn ->
             val code = btn.toInt() and 0xFF
-            val label = when (code) {
-                0x09 -> { zoomIn();  "Zoom in (right)" }
-                0x0A -> { zoomOut(); "Zoom out (left)" }
+            val call = com.example.northstar.media.CallInfoProvider.incomingCall.value
+            val ringing = call?.incoming == true
+            val active  = call != null && !call.incoming
+            val label = when {
+                // Ringing: IN answers, DOWN rejects. Active call: DOWN hangs up (fixes "can't end").
+                ringing && code == BTN_ANSWER -> { answerCall(call!!); "Call answered" }
+                ringing && code == BTN_REJECT -> { endCall(call!!);    "Call rejected" }
+                active  && code == BTN_REJECT -> { endCall(call!!);    "Call ended" }
+                // Map/media controls run whenever a call ISN'T ringing (still usable during an active
+                // call — only DOWN is reserved for hang-up, and that's not a map/media code anyway).
+                !ringing && code == BTN_MAP_ZOOM_IN  -> { zoomIn();  "Zoom in (map)" }
+                !ringing && code == BTN_MAP_ZOOM_OUT -> { zoomOut(); "Zoom out (map)" }
+                !ringing && code == BTN_MEDIA_NEXT -> { mediaInfo.skipNext(); "Next track" }
+                !ringing && code == BTN_MEDIA_PREV -> { mediaInfo.skipPrevious(); "Previous track" }
                 else -> "code 0x${code.toString(16).uppercase()}"
             }
-            _ui.value = _ui.value.copy(lastButton = label)
+            // Persist every button code so untethered tests are diagnosable from the remote pull
+            // (the on-screen readout is invisible with the phone screen off / projecting).
+            com.example.northstar.data.RideDiagnostics.log("button",
+                "0x%02X (ringing=%b active=%b) → %s".format(code, ringing, active, label))
+            _ui.update { it.copy(lastButton = label) }
         }
     }
 
@@ -218,14 +420,52 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
             wifi == WifiConnStatus.REQUESTING || wifi == WifiConnStatus.CONNECTED -> ConnStage.WIFI
             else -> ConnStage.OFFLINE
         }
-        _ui.value = _ui.value.copy(stage = stage)
+        _ui.update { it.copy(stage = stage) }
     }
 
     // ── Connection ─────────────────────────────────────────────────────────
 
     fun connect() {
         userWantsConnection = true
-        _ui.value = _ui.value.copy(errorMessage = null)
+        authAttempts = 0
+        _ui.update { it.copy(errorMessage = null, retryAttempt = 0, needsWifiOn = false, needsLocationOn = false) }
+
+        // The dash link needs the Wi‑Fi radio on (WifiNetworkSpecifier joins it as a separate
+        // per-app network — the phone's current Wi‑Fi/cellular is untouched). Android 10+ won't
+        // let us enable Wi‑Fi for the user, so if it's off, surface it immediately and let the UI
+        // open the Wi‑Fi panel — far better than a silent 30s timeout.
+        if (!wifiManager.isWifiEnabled()) {
+            userWantsConnection = false
+            _ui.update { it.copy(stage = ConnStage.ERROR, needsWifiOn = true,
+                errorMessage = "Turn on Wi‑Fi to connect to the dash") }
+            return
+        }
+
+        // First pairing needs the EXACT dash SSID. The OS only reveals it (both WiFi scan results AND
+        // the connected network's WifiInfo.ssid) when Location Services — the master toggle, NOT just
+        // the runtime permission — is ON. With it off the SSID stays empty and the dash silently
+        // rejects the encrypted auth handshake (looks like a generic "auth timed out"). Surface the
+        // real cause. Only gates FIRST pairing; once the SSID is learned + stored, scanning isn't needed.
+        if (dashConfig.needsDiscovery &&
+            !com.example.northstar.util.DeviceReadiness.locationServicesEnabled(getApplication())) {
+            userWantsConnection = false
+            _ui.update { it.copy(stage = ConnStage.ERROR, needsLocationOn = true,
+                errorMessage = "Turn on Location to find your dash (needed once, to pair)") }
+            return
+        }
+
+        com.example.northstar.data.RideDiagnostics.init(getApplication())
+        com.example.northstar.data.RideDiagnostics.start("connect")
+        // Stamp the running build's identity into the log so a pulled ride is matched 1:1 to the
+        // pushed APK — never again analyse a ride and not know which build produced it.
+        com.example.northstar.data.RideDiagnostics.log(
+            "build", "apk=${com.example.northstar.util.BuildId.sha12(getApplication())}" +
+                " vc=${com.example.northstar.BuildConfig.VERSION_CODE} name=${com.example.northstar.BuildConfig.VERSION_NAME}",
+        )
+        com.example.northstar.data.RideDiagnostics.log(
+            "connect", "ssid='${dashConfig.ssid}' needsDiscovery=${dashConfig.needsDiscovery} dest=${_ui.value.destinationName}",
+        )
+        loggedFirstFrame = false
         DashKeepAliveService.start(getApplication())
         location.start()
         startRecording()
@@ -236,7 +476,7 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
         if (dashConfig.needsDiscovery) {
             wifiManager.findDashSsid(dashConfig.ssidPrefix)?.let { found ->
                 dashConfig.ssid = found
-                _ui.value = _ui.value.copy(ssid = found)
+                _ui.update { it.copy(ssid = found) }
             }
         }
 
@@ -255,13 +495,86 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
 
     fun disconnect() {
         userWantsConnection = false
+        cancelReconnectGiveup()
+        com.example.northstar.data.RideDiagnostics.log("connect", "user disconnect")
         stopRecording()        // a connect→disconnect session = one saved ride
-        teardown()
         session.disconnect()
         wifiManager.disconnect()
-        location.stop()
-        DashKeepAliveService.stop(getApplication())
+        releaseBackgroundResources()
         refreshStage()
+        com.example.northstar.data.RideDiagnostics.stop("disconnect")
+        // Ride just ended and internet is back (dash WiFi released) — flush the log to Firestore
+        // now so it's retrievable even if the app isn't reopened. Test-channel + Firebase-gated.
+        com.example.northstar.data.DiagnosticsUploader.uploadPending(getApplication())
+    }
+
+    /**
+     * Release everything that keeps the CPU/GPS/WiFi awake: the foreground service
+     * (PARTIAL_WAKE_LOCK + WifiLock), GPS updates, and the encoder/stream loop. Called
+     * whenever the connection has ended so the app stops draining the battery in the
+     * background — on an explicit disconnect, on a terminal connection failure (dash
+     * unreachable / handshake exhausted), and when the ViewModel is cleared.
+     */
+    private fun releaseBackgroundResources() {
+        teardown()                                   // stream loop + encoder + frame bitmap
+        location.stop()                              // stop GPS updates
+        DashKeepAliveService.stop(getApplication())  // release wake + wifi locks
+    }
+
+    /**
+     * Complete stop of all background work — including the Wi‑Fi manager's reconnect loop, which
+     * [releaseBackgroundResources] alone does NOT stop (that loop re-joins the dash AP every few
+     * seconds and was the main source of drain after the dash went away). The session stays in
+     * ERROR so the Dash screen still shows "Couldn't connect" + Try again.
+     */
+    private fun giveUp(reason: String) {
+        cancelReconnectGiveup()
+        userWantsConnection = false
+        session.disconnect()
+        wifiManager.disconnect()       // stops the indefinite AP reconnect loop
+        releaseBackgroundResources()
+        refreshStage()
+        com.example.northstar.data.RideDiagnostics.log("error", "gave up: $reason — background released")
+        com.example.northstar.data.RideDiagnostics.stop(reason)
+    }
+
+    /** Start the give-up countdown if it isn't already running (idempotent). */
+    private fun armReconnectGiveup() {
+        if (giveupJob?.isActive == true) return
+        giveupJob = viewModelScope.launch {
+            delay(RECONNECT_GIVEUP_MS)
+            if (session.state.value != DashState.STREAMING) giveUp("reconnect window elapsed")
+        }
+    }
+
+    private fun cancelReconnectGiveup() { giveupJob?.cancel(); giveupJob = null }
+
+    // Non-silent disconnect alert: this dash-AP-hang failure only recovers after the rider
+    // power-cycles the bike, so they must KNOW the link dropped. Fire once after a sustained loss
+    // (not a transient blip) via vibration + a BT-routed voice cue, so it carries through the helmet
+    // with the phone screen off. Re-armed each non-streaming state; cancelled (and reset) on recovery.
+    private fun armConnLostAlert() {
+        if (connLostAlertJob?.isActive == true || connLostAlerted) return
+        connLostAlertJob = viewModelScope.launch {
+            delay(CONN_LOST_ALERT_MS)
+            if (session.state.value != DashState.STREAMING && userWantsConnection) {
+                connLostAlerted = true
+                com.example.northstar.data.RideDiagnostics.log("connect", "sustained link loss → rider alert (vibrate + voice)")
+                runCatching {
+                    val v = getApplication<Application>().getSystemService(android.os.Vibrator::class.java)
+                    v?.vibrate(android.os.VibrationEffect.createWaveform(longArrayOf(0, 300, 200, 300, 200, 300), -1))
+                }
+                voice.alert("Dash disconnected. Restart the dash to reconnect.")
+            }
+        }
+    }
+
+    private fun cancelConnLostAlert() {
+        connLostAlertJob?.cancel(); connLostAlertJob = null
+        if (connLostAlerted) {
+            connLostAlerted = false
+            voice.alert("Dash reconnected")
+        }
     }
 
     // ── Ride recording (the connected session) ───────────────────────────────
@@ -270,7 +583,7 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
         recorder.start()
         recordJob = viewModelScope.launch {
             location.location.collect { loc ->
-                if (loc != null) recorder.add(loc.latitude, loc.longitude, loc.speed, loc.time)
+                if (loc != null) recorder.add(loc.latitude, loc.longitude, loc.speed, loc.accuracy, loc.time)
             }
         }
     }
@@ -279,14 +592,15 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
         recordJob?.cancel(); recordJob = null
         if (!recorder.isRecording) return
         val ride = recorder.stop() ?: return   // null = trivial session, don't save
-        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) { repo.addRide(ride) }
+        repo.addRide(ride)   // self-scoped on the repo (survives ViewModel teardown)
+        android.util.Log.i("DashViewModel", "Ride saved: ${"%.1f".format(ride.distanceKm)} km, ${ride.durationSec}s")
     }
 
     // ── Dash WiFi config (Settings) ──────────────────────────────────────────
-    fun setSsid(s: String) { dashConfig.ssid = s.trim(); _ui.value = _ui.value.copy(ssid = s.trim()) }
-    fun setWifiPassword(p: String) { dashConfig.password = p; _ui.value = _ui.value.copy(wifiPassword = p) }
+    fun setSsid(s: String) { dashConfig.ssid = s.trim(); _ui.update { it.copy(ssid = s.trim()) } }
+    fun setWifiPassword(p: String) { dashConfig.password = p; _ui.update { it.copy(wifiPassword = p) } }
     /** Forget the paired dash so the next connect rediscovers any RE_* dash by prefix. */
-    fun forgetDash() { dashConfig.forgetDash(); _ui.value = _ui.value.copy(ssid = "") }
+    fun forgetDash() { dashConfig.forgetDash(); _ui.update { it.copy(ssid = "") } }
 
     // ── Destination + routing ───────────────────────────────────────────────
 
@@ -296,16 +610,16 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun setDestination(name: String, lat: Double?, lng: Double?) {
-        _ui.value = _ui.value.copy(
+        _ui.update { it.copy(
             destinationName = name, hasRoute = false,
             destLatLng = if (lat != null && lng != null) lat to lng else null,
             routePoints = emptyList(),
-        )
+        ) }
         destLat = lat
         destLng = lng
         route = null
         progressM = 0.0
-        smoothEtaSec = 0.0; etaArrivalMs = 0L   // fresh ETA for the new route
+        smoothEtaSec = 0.0; etaArrivalMs = 0L; displayedEtaMin = null   // fresh ETA for the new route
         voice.resetTrip()   // fresh announcements for the new route
         session.updateRouteCard(name)
         if (lat != null && lng != null) {
@@ -323,10 +637,10 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
         progressM = 0.0
         offRouteSince = 0L
         panX = 0f; panY = 0f; followMode = true
-        smoothEtaSec = 0.0; etaArrivalMs = 0L
+        smoothEtaSec = 0.0; etaArrivalMs = 0L; displayedEtaMin = null
         voice.resetTrip()
         lastSignature = ""   // force a redraw with no route line
-        _ui.value = _ui.value.copy(
+        _ui.update { it.copy(
             destinationName = null,
             hasRoute = false,
             destLatLng = null,
@@ -336,7 +650,7 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
             maneuver = null,
             offRoute = false,
             followMode = true,
-        )
+        ) }
         session.updateRouteCard("Northstar")   // dash card → name + 0.0 km, nav off
     }
 
@@ -352,7 +666,7 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
             if (r != null) {
                 route = r
                 tiles.prefetchRoute(r.geometry)
-                _ui.value = _ui.value.copy(hasRoute = true, routePoints = r.geometry)
+                _ui.update { it.copy(hasRoute = true, routePoints = r.geometry) }
                 android.util.Log.i("DashViewModel", "Route ready: ${r.geometry.size} pts, ${r.totalMeters.toInt()} m")
             } else {
                 android.util.Log.w("DashViewModel", "Router returned null")
@@ -362,34 +676,56 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
 
     // ── Map controls ────────────────────────────────────────────────────────
 
-    fun zoomIn()  { zoom = (zoom + 1).coerceAtMost(20); _ui.value = _ui.value.copy(mapZoom = zoom) }
-    fun zoomOut() { zoom = (zoom - 1).coerceAtLeast(11); _ui.value = _ui.value.copy(mapZoom = zoom) }
+    fun zoomIn()  = setZoom(zoom + 1)
+    fun zoomOut() = setZoom(zoom - 1)
+    private fun setZoom(z: Int) {
+        val clamped = z.coerceIn(11, 20)
+        if (clamped == zoom) return
+        zoom = clamped
+        _ui.update { it.copy(mapZoom = zoom) }
+        // Make zoom feel instant: force a redraw on the very next tick (the renderer bridges the
+        // gap with scaled neighbouring-zoom tiles), and warm the real tiles for the new level so
+        // the scaled view sharpens in quickly.
+        lastSignature = ""
+        if (camInit) tiles.prefetchZoom(camLat, camLng, zoom)
+    }
     fun panBy(dx: Float, dy: Float) = manualPan(dx, dy)
     fun recenter() {
         panX = 0f; panY = 0f; followMode = true
-        _ui.value = _ui.value.copy(followMode = true)
+        _ui.update { it.copy(followMode = true) }
     }
     fun toggleHeadingUp() {
         headingUp = !headingUp
-        _ui.value = _ui.value.copy(headingUp = headingUp)
+        _ui.update { it.copy(headingUp = headingUp) }
     }
 
     private fun manualPan(dx: Float, dy: Float) {
         panX += dx; panY += dy
         followMode = false
         lastManualPanAt = System.currentTimeMillis()
-        _ui.value = _ui.value.copy(followMode = false)
+        _ui.update { it.copy(followMode = false) }
     }
 
     // ── Video + nav loop ────────────────────────────────────────────────────
 
     private fun startStream() {
+        com.example.northstar.data.RideDiagnostics.log("stream", "startStream — encoder up, RTP→dash beginning")
+        videoPtsMs = 0L
         val packetizer = RtpPacketizer { rtpPkt -> session.sendRtp(rtpPkt) }
         val nalProc    = NalProcessor { nal, _ ->
-            packetizer.packetize(nal, endOfAU = true, wallClockMs = System.currentTimeMillis())
+            // Even, monotonic presentation timestamp (set per frame by the send loop) instead of
+            // wall clock — so the dash sees a clean, evenly-spaced timeline regardless of tiny
+            // send-time wobble. All NALs of one frame share the same value.
+            packetizer.packetize(nal, endOfAU = true, wallClockMs = videoPtsMs)
         }
-        val onEncoded: (ByteArray, Boolean) -> Unit = { annexB, _ ->
+        val onEncoded: (ByteArray, Boolean) -> Unit = { annexB, isKey ->
             nalProc.process(annexB)
+            // First encoded frame leaving the phone — its delay after READY is the prime suspect
+            // for the dash's "Timeout!" (the dash waits for video and gives up if it's late).
+            if (!loggedFirstFrame) {
+                loggedFirstFrame = true
+                com.example.northstar.data.RideDiagnostics.log("stream", "first video frame sent (key=$isKey, ${annexB.size}B)")
+            }
             // Atomic update: this runs on the encoder's callback thread, concurrent with the
             // frame loop's _ui writes — a plain copy() read-modify-write would drop updates.
             _ui.update { it.copy(frameCount = it.frameCount + 1) }
@@ -400,31 +736,58 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
         frameBitmap = Bitmap.createBitmap(DashEncoder.WIDTH, DashEncoder.HEIGHT, Bitmap.Config.ARGB_8888)
         lastSignature = ""
         // Fresh camera so it snaps to the first fix instead of gliding from a stale spot.
-        camInit = false; lastTickNs = 0L; lastFixTime = 0L
+        camInit = false; lastTickNs = 0L; lastFixTime = 0L; heldRider = null
 
         session.startStreaming()
+        startMediaForwarding()
         location.location.value?.let { tiles.prefetch(it.latitude, it.longitude) }
 
         streamJob = viewModelScope.launch(Dispatchers.Default) {
             var lastPrefetch = 0L
             var failures = 0
+            // Motion-adaptive, absolute-grid pacing (RE-style). Each iteration tick() tells us whether
+            // the map actually changed; we hold the fast profile (FRAME_MS_ACTIVE) for MOTION_HOLD_MS
+            // after the last change, then settle to the slow profile (FRAME_MS_IDLE). The grid sleeps
+            // only the REMAINDER to the next frame so render+encode work doesn't make the cadence
+            // wobble — uneven arrival is what makes the dash decoder jitter/teleport. videoPtsMs
+            // advances by the interval actually used so RTP timestamps stay proportional to real time.
+            var lastChangeMs = System.currentTimeMillis()
+            var idleBitrate = false   // track the live profile so we only poke the encoder on a switch
+            var frameMs = FRAME_MS_ACTIVE
+            var nextFrameMs = System.currentTimeMillis()
+            var lastSendMs = System.currentTimeMillis()
             // The loop must NEVER die silently: the session's heartbeats keep the dash
             // connected, so a dead frame loop = frozen map with the connection "up".
             while (isActive && session.state.value == DashState.STREAMING) {
                 try {
-                    tick()
-                    // Push the (possibly cached) frame to the encoder at a steady 4 fps.
+                    val changed = tick()
+                    val nowMs = System.currentTimeMillis()
+                    if (changed) lastChangeMs = nowMs
+                    // Active while the map changed recently; idle once it's been still for MOTION_HOLD_MS.
+                    val active = nowMs - lastChangeMs < MOTION_HOLD_MS
+                    frameMs = if (active) FRAME_MS_ACTIVE else FRAME_MS_IDLE
                     val bmp = frameBitmap
                     val enc = encoder
                     if (bmp != null && enc != null) {
+                        // Switch the encoder bitrate to match the profile, but only on a transition.
+                        if (active && idleBitrate) { enc.requestBitrate(DashEncoder.BITRATE); idleBitrate = false }
+                        else if (!active && !idleBitrate) { enc.requestBitrate(DashEncoder.BITRATE_IDLE); idleBitrate = true }
                         enc.renderFrame { canvas -> canvas.drawBitmap(bmp, 0f, 0f, null) }
+                        // Advance the presentation clock by THIS frame's interval BEFORE draining, so the
+                        // frame(s) pulled this iteration carry an evenly-spaced RTP timestamp.
+                        videoPtsMs += frameMs
                         enc.drain()
                     }
                     failures = 0
+                    // Track the real send cadence (EMA + worst) so the ride log proves it's even.
+                    val sendNow = System.currentTimeMillis()
+                    val gap = sendNow - lastSendMs
+                    lastSendMs = sendNow
+                    sendPaceMs = if (sendPaceMs <= 0.0) gap.toDouble() else sendPaceMs + (gap - sendPaceMs) * 0.1
+                    if (gap > sendPaceMaxMs) sendPaceMaxMs = gap
                     // Warm the tile cache ahead of the rider every ~20 s.
-                    val now = System.currentTimeMillis()
-                    if (now - lastPrefetch > 20_000) {
-                        lastPrefetch = now
+                    if (sendNow - lastPrefetch > 20_000) {
+                        lastPrefetch = sendNow
                         location.location.value?.let { tiles.prefetch(it.latitude, it.longitude) }
                     }
                 } catch (e: CancellationException) {
@@ -444,18 +807,29 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
                         failures = 0
                     }
                 }
-                // Dynamic pacing: buttery while moving, throttled when stopped (power).
-                delay(1000L / (if (camMoving) FPS_MOVING else FPS_IDLE))
+                // Sleep only the remaining time to the next grid point.
+                nextFrameMs += frameMs
+                val sleepMs = nextFrameMs - System.currentTimeMillis()
+                if (sleepMs > 1) {
+                    delay(sleepMs)
+                } else if (sleepMs < -frameMs) {
+                    // Fell more than a frame behind (render spike) — re-anchor so we don't fire a
+                    // burst of catch-up frames (which would itself look like a jump).
+                    nextFrameMs = System.currentTimeMillis()
+                }
             }
         }
     }
 
-    /** Compute nav state, push nav-info to the dash, and redraw the frame only if it changed. */
-    private fun tick() {
+    /**
+     * Compute nav state, push nav-info to the dash, and redraw the frame only if it changed.
+     * @return true if the visible map content changed this tick (drives the motion-adaptive cadence).
+     */
+    private fun tick(): Boolean {
         // Revert to follow mode after the rider stops nudging the joystick.
         if (!followMode && System.currentTimeMillis() - lastManualPanAt > MANUAL_IDLE_MS) {
             panX = 0f; panY = 0f; followMode = true
-            _ui.value = _ui.value.copy(followMode = true)
+            _ui.update { it.copy(followMode = true) }
         }
 
         val loc = location.location.value
@@ -468,42 +842,84 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
 
         var remainingM: Double? = null
         var etaSec: Double? = null
-        // Keep the last heading on GPS dropout (tunnels) — don't snap the map to north.
-        var heading = loc?.bearing ?: (if (camInit) camHdg else 0f)
+        // Heading-up direction. GPS bearing is trustworthy ONLY while genuinely moving — at a
+        // standstill (or a near-zero crawl) it's noise and would rotate the map to a random or
+        // opposite direction the instant you stop. So adopt it only above BEARING_MIN_SPEED (and
+        // when the fix actually carries a bearing); otherwise HOLD the last heading shown while
+        // moving. Also keeps the last heading through a GPS dropout (tunnels).
+        var heading = when {
+            loc != null && loc.hasBearing() && loc.speed >= BEARING_MIN_SPEED -> loc.bearing
+            camInit -> camHdg
+            else -> 0f
+        }
         var offRoute = false
+        var recalculating = false
 
         if (r != null && loc != null) {
             val ns = trackProgress(r, GeoPoint(loc.latitude, loc.longitude))
             remainingM = ns.remainingM
-            offRoute = ns.offRoute
+            // Heading-aware off-route. A flyover (or its service road) runs PARALLEL to and almost
+            // on top of the route, so flat GPS can sit well past the lateral threshold while the
+            // rider is still effectively on the line. Distance alone then cries "off-route" and
+            // triggers a sudden reroute. So in the ambiguous band we require the heading to ALSO
+            // disagree (a genuine divergence / wrong turn); a clearly different road (very far) is
+            // off-route regardless. This is the main flyover-confusion mitigation.
+            lastSnapDist = ns.snapDist
+            val headingKnown = loc.hasBearing() && loc.speed >= BEARING_MIN_SPEED
+            val headingOff = headingKnown && angleDelta(loc.bearing, ns.heading) > 50f
+            offRoute = when {
+                ns.snapDist > 150.0 -> true       // unmistakably a different road → off regardless
+                ns.snapDist > 70.0  -> headingOff // parallel/flyover band: off ONLY if heading diverges
+                else -> false                     // (stopped here → not off-route; decide once moving)
+            }
             // NOTE: no marker snapping. Raw GPS is accurate; snapping to the route
             // polyline pinned the rider onto a parallel road in dense areas (showed
             // "Indira Enclave" when actually at "Isha"). trackProgress is still used
-            // for nav distances + off-route/reroute detection (ns.offRoute), just not
-            // to move the displayed marker.
-            if (loc.speed < 0.5f) heading = ns.heading
-            val speed = if (loc.speed > 0.5f) loc.speed.toDouble() else 11.0
-            // Smooth the ETA so it doesn't flicker every second with raw speed; recompute the
-            // absolute arrival clock only every 5 s so "arrives 1:32 PM" stays steady.
-            val rawEta = ns.remainingM / speed
-            smoothEtaSec = if (smoothEtaSec <= 0.0) rawEta else smoothEtaSec + (rawEta - smoothEtaSec) * 0.08
-            etaSec = smoothEtaSec
+            // for nav distances + off-route/reroute detection, just not to move the marker.
+            // (Heading is handled above — held steady at low speed, not snapped to the route
+            // segment, so a stop doesn't rotate the map.)
             val nowMs = System.currentTimeMillis()
-            if (etaArrivalMs == 0L || nowMs - lastArrivalCalcMs > 5_000) {
-                etaArrivalMs = nowMs + (smoothEtaSec * 1000).toLong()
-                lastArrivalCalcMs = nowMs
+
+            // "Recalculating" = off the line for >0.8 s (ignores a 1-frame GPS blip), OR a reroute
+            // request is in flight. While true the distance is measured against a route we've left,
+            // so the ETA is meaningless — we FREEZE it (and the pill says "Recalculating") rather
+            // than let the number lurch until the fresh route lands. recalcHoldUntil keeps the pill
+            // up a beat after the new route lands so a fast reroute is still visible to the rider.
+            if (offRoute) { if (offRouteStreakStart == 0L) offRouteStreakStart = nowMs }
+            else offRouteStreakStart = 0L
+            val rawRecalc = rerouting || (offRouteStreakStart != 0L && nowMs - offRouteStreakStart > 800)
+            if (rawRecalc) recalcHoldUntil = nowMs + 1_500
+            recalculating = rawRecalc || nowMs < recalcHoldUntil
+
+            if (!recalculating) {
+                // Steady ETA: divide remaining distance by a ROLLING AVERAGE speed (held through
+                // stops), not the instantaneous value — so it tracks a typical pace instead of
+                // swinging every time you brake, accelerate or sit at a light.
+                if (loc.speed > 0.5f) {
+                    smoothSpeedMps = if (smoothSpeedMps <= 0.0) loc.speed.toDouble()
+                                     else smoothSpeedMps + (loc.speed - smoothSpeedMps) * 0.05
+                }
+                val speed = smoothSpeedMps.coerceAtLeast(3.0)  // floor: no absurd ETA at a crawl
+                val rawEta = ns.remainingM / speed
+                smoothEtaSec = if (smoothEtaSec <= 0.0) rawEta else smoothEtaSec + (rawEta - smoothEtaSec) * 0.08
+                // Refresh the displayed minutes + arrival clock only every 5 s so they read steady
+                // (like Google Maps) instead of flickering every second.
+                if (etaArrivalMs == 0L || nowMs - lastArrivalCalcMs > 5_000) {
+                    etaArrivalMs = nowMs + (smoothEtaSec * 1000).toLong()
+                    displayedEtaMin = Math.round(smoothEtaSec / 60.0).toInt()
+                    lastArrivalCalcMs = nowMs
+                }
             }
+            etaSec = if (smoothEtaSec > 0.0) smoothEtaSec else null
             // Feed the dash's own turn-by-turn widget with CORRECT distances (next-turn
-            // + total remaining) and real arrival time. Glyph stays CONTINUE until
+            // + total remaining) and the (held) arrival time. Glyph stays CONTINUE until
             // other codes are verified.
             val (pv, pu) = toDashDistance(ns.nextTurnM)
             val (tv, tu) = toDashDistance(ns.remainingM)
-            val arrival = java.util.Calendar.getInstance().apply {
-                add(java.util.Calendar.SECOND, etaSec!!.toInt())
+            val etaHHMM = etaSec?.let {
+                val arrival = java.util.Calendar.getInstance().apply { add(java.util.Calendar.SECOND, it.toInt()) }
+                "%02d%02d".format(arrival.get(java.util.Calendar.HOUR_OF_DAY), arrival.get(java.util.Calendar.MINUTE))
             }
-            val etaHHMM = "%02d%02d".format(
-                arrival.get(java.util.Calendar.HOUR_OF_DAY), arrival.get(java.util.Calendar.MINUTE)
-            )
             session.updateNavInfo(DashCommands.NAV_MANEUVER_CONTINUE, pv, pu, tv, tu, etaHHMM)
             // Spoken/chime turn guidance (no-op when voice mode is OFF).
             voice.maybeAnnounce(ns.nextManeuver, ns.nextTurnM, ns.remainingM)
@@ -516,37 +932,106 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
         // Recompute the route if the rider has clearly left it for a few seconds.
         maybeReroute(offRoute, loc)
 
+        // GPS health: LOST if no fresh fix for a few seconds (or none at all), WEAK if the fix is
+        // imprecise or coming in slowly, else GOOD. Drives the on-dash indicator and marker colour.
+        val fixAgeMs = if (fixWallMs > 0L) System.currentTimeMillis() - fixWallMs else Long.MAX_VALUE
+        gpsStatus = when {
+            loc == null || fixAgeMs > 4_000 -> GpsStatus.LOST
+            loc.accuracy > 25f || gpsFixIntervalMs > 2_500 -> GpsStatus.WEAK
+            else -> GpsStatus.GOOD
+        }
+
         // Publish nav figures to the phone UI.
-        _ui.value = _ui.value.copy(
+        _ui.update { it.copy(
             hasGps = loc != null,
+            gpsStatus = gpsStatus,
             riderLat = matchedLat,
             riderLng = matchedLng,
             riderBearing = heading,
-            remainingKm = remainingM?.let { it / 1000.0 },
-            etaMinutes = etaSec?.let { (it / 60.0).toInt() },
+            remainingKm = remainingM?.let { d -> d / 1000.0 },
+            etaMinutes = if (etaSec != null) displayedEtaMin else null,
             maneuver = null,
             offRoute = offRoute,
-        )
+            recalculating = recalculating,
+        ) }
 
         updateThermal()
+
+        // Periodic ride snapshot (~15 s) — GPS quality, motion, frame throughput and thermal,
+        // so a post-ride read shows where the map stuttered (weak GPS) or the dash struggled.
+        val nowD = System.currentTimeMillis()
+        if (nowD - lastDiagMs > 15_000) {
+            lastDiagMs = nowD
+            com.example.northstar.data.RideDiagnostics.log(
+                "ride",
+                "gps=" + (loc?.let { "acc=%.0fm spd=%.1fm/s".format(it.accuracy, it.speed) } ?: "none") +
+                    " fixGap=%.0fms".format(gpsFixIntervalMs) +
+                    " frames=${_ui.value.frameCount} thermal=${_ui.value.thermal}" +
+                    " pace=%.0fms/max=%dms".format(sendPaceMs, sendPaceMaxMs) +  // send cadence (≈250ms active / 500ms idle)
+                    " remaining=" + (remainingM?.let { "%.1fkm".format(it / 1000.0) } ?: "-") +
+                    " offRoute=$offRoute" +
+                    (if (lastSnapDist >= 0) " snap=%.0fm".format(lastSnapDist) else ""),
+            )
+            sendPaceMaxMs = 0L  // reset the worst-case window each diag line
+        }
 
         // ── Predictive, framerate-independent camera (CarPlay-smooth) ──
         // Capture each fresh GPS fix + its velocity for dead-reckoning.
         if (loc != null && loc.time != lastFixTime) {
             lastFixTime = loc.time
+            // Track the GAP between fixes (EMA): if this balloons past ~1 s with the screen off,
+            // GPS callbacks are being throttled — that's what the predictor has to bridge and the
+            // root of any residual "stuck then teleport". Logged in the periodic ride line.
+            val nowWall = System.currentTimeMillis()
+            if (fixWallMs > 0L) {
+                val gap = (nowWall - fixWallMs).toDouble()
+                gpsFixIntervalMs = if (gpsFixIntervalMs <= 0.0) gap else gpsFixIntervalMs + (gap - gpsFixIntervalMs) * 0.3
+            }
             fixLat = loc.latitude; fixLng = loc.longitude
             fixBearing = loc.bearing; fixSpeed = loc.speed
-            fixWallMs = System.currentTimeMillis()
+            fixWallMs = nowWall
         }
         // Extrapolate where the rider IS NOW (last fix + velocity·elapsed), so the camera
         // doesn't trail the bike between 1 Hz fixes. Only predict while genuinely moving.
         val rider: Pair<Double, Double>? = when {
             loc == null -> null
-            fixSpeed > 1.0f -> {
-                val elapsed = ((System.currentTimeMillis() - fixWallMs) / 1000.0).coerceAtMost(1.5)
-                project(fixLat, fixLng, fixBearing.toDouble(), fixSpeed * elapsed)
+            fixSpeed > 0.5f -> {
+                // Dead-reckon forward from the last fix so the camera keeps GLIDING through GPS
+                // gaps instead of freezing then snapping ("stuck then jump"). predictedDistance
+                // runs at full speed for the first ~1 s (the normal 1 Hz fix gap) then tapers, so
+                // a long dropout — or a brake/stop the predictor hasn't heard about yet — can't
+                // fling the camera far ahead; the next fix then needs only a tiny eased correction.
+                // elapsed = time since the fix arrived; + DISPLAY_LEAD_S leads the marker past
+                // "now" to cancel the camera-ease + encode + RTP + dash-decode/display latency, so
+                // the dash tracks the bike instead of trailing ~0.5 s behind. The predictor's taper
+                // still caps how far a long dropout / unannounced brake can fling it.
+                val elapsed = (System.currentTimeMillis() - fixWallMs) / 1000.0
+                // Weak-GPS guard: a noisy fix has an unreliable position AND bearing/speed, so
+                // extrapolating from it flings the view ("teleport"). Scale the prediction down as
+                // accuracy worsens — but only for GENUINELY poor fixes: full up to 25 m, none above
+                // 50 m. The old 12 m cutoff scaled prediction DOWN at the moderate accuracy that's
+                // normal at speed, so the predictor undershot → the camera lagged → each new fix
+                // snap-corrected forward = the "jumping when moving fast". Widening it keeps the
+                // dead-reckon gliding through the 1 Hz gaps at speed while still guarding bad fixes.
+                val conf = ((50f - (loc.accuracy)) / 25f).toDouble().coerceIn(0.0, 1.0)
+                val dist = predictedDistance(fixSpeed, elapsed + DISPLAY_LEAD_S) * conf
+                // Remember where the bike actually is, so that when it stops the marker holds the
+                // real fix (not the lead-projected point ahead of it).
+                heldRider = fixLat to fixLng
+                project(fixLat, fixLng, fixBearing.toDouble(), dist)
             }
-            else -> matchedLat!! to matchedLng!!
+            else -> {
+                // Stopped: hold position and IGNORE sub-accuracy GPS wander, so a parked bike's dot
+                // doesn't drift or jitter. Only move the held point if the fix steps clearly outside
+                // its own error radius (i.e. the bike really moved a little / GPS re-converged).
+                val cand = matchedLat!! to matchedLng!!
+                val h = heldRider
+                val band = loc.accuracy.coerceIn(8f, 30f).toDouble()
+                if (h == null || GeoPoint.distMeters(
+                        GeoPoint(h.first, h.second), GeoPoint(cand.first, cand.second)
+                    ) > band
+                ) { heldRider = cand; cand } else h
+            }
         }
 
         val haveTarget = rider != null || (dLat != null && dLng != null)
@@ -558,9 +1043,18 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
         val nowNs = System.nanoTime()
         val dt = if (lastTickNs == 0L) 0.042 else ((nowNs - lastTickNs) / 1e9).coerceIn(0.0, 0.5)
         lastTickNs = nowNs
-        val a = if (camInit) (1.0 - Math.exp(-dt / SMOOTH_TAU)) else 1.0
+        // Adaptive smoothing: ease HARDER (bigger time constant) when the fix is noisy so weak-GPS
+        // jitter doesn't reach the camera, and stay snappy when the signal is clean. This is the
+        // other half of the "stuck then jump" fix — the predictor bridges gaps, this absorbs the
+        // lateral noise that makes a poor signal jitter.
+        val acc = loc?.accuracy ?: 12f
+        val tau = when {
+            acc > 25f -> SMOOTH_TAU * 2.0   // poor signal → heavy smoothing
+            acc > 12f -> SMOOTH_TAU * 1.5   // fair
+            else      -> SMOOTH_TAU         // good → responsive
+        }
+        val a = if (camInit) (1.0 - Math.exp(-dt / tau)) else 1.0
 
-        val prevLat = camLat; val prevLng = camLng
         if (haveTarget) {
             if (!camInit) { camLat = targetLat; camLng = targetLng; camHdg = heading; camInit = true }
             else {
@@ -573,9 +1067,6 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
         // Lock the dash marker to the smoothed centre (map slides under it).
         frameRiderLat = if (rider != null) camLat else null
         frameRiderLng = if (rider != null) camLng else null
-        // Drive the dynamic frame rate: full speed while moving/turning, throttle when idle.
-        val movedM = if (camInit) GeoPoint.distMeters(GeoPoint(prevLat, prevLng), GeoPoint(camLat, camLng)) else 0.0
-        camMoving = movedM > 0.25 || (loc?.speed ?: 0f) > 0.8f
 
         val centerLat = if (haveTarget) camLat else 0.0
         val centerLng = if (haveTarget) camLng else 0.0
@@ -590,13 +1081,20 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
             append(if (headingUp) (camHeading * 10).toInt() else 0)
             append(remainingM?.let { (it / 100).toInt() } ?: -1) // 100 m resolution to avoid jitter
             append(if (r != null) r.geometry.size else 0)
+            // Include the incoming-call caller so a call arriving forces an immediate redraw of the
+            // banner even when the map is static (otherwise it'd wait for the 2 s forced refresh).
+            append(com.example.northstar.media.CallInfoProvider.incomingCall.value?.takeIf { it.incoming }?.caller ?: "")
         }
         val now = System.currentTimeMillis()
-        if (sig != lastSignature || now - lastRedrawAt > FORCE_REDRAW_MS) {
+        // A genuine content change (not the periodic forced refresh) is what marks the map as
+        // "moving" for the adaptive cadence — a forced redraw of identical content stays "idle".
+        val contentChanged = sig != lastSignature
+        if (contentChanged || now - lastRedrawAt > FORCE_REDRAW_MS) {
             lastSignature = sig
             lastRedrawAt = now
             redrawFrame(centerLat, centerLng, camHeading, remainingM)
         }
+        return contentChanged
     }
 
     /**
@@ -609,21 +1107,29 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
         if (!offRoute || loc == null || dLat == null || dLng == null) { offRouteSince = 0L; return }
         val now = System.currentTimeMillis()
         if (offRouteSince == 0L) offRouteSince = now
-        if (now - offRouteSince < 4_000 || now - lastRerouteAt < 12_000 || rerouting) return
+        // Reroute faster: 2 s off-line confirms a real miss (not a GPS wobble), 6 s cooldown
+        // between attempts. Was 4 s / 12 s, which felt sluggish after a missed turn.
+        if (now - offRouteSince < 2_000 || now - lastRerouteAt < 6_000 || rerouting) return
         lastRerouteAt = now
         rerouting = true
-        android.util.Log.i("DashViewModel", "Off-route ${(now - offRouteSince) / 1000}s → rerouting")
+        val offSec = (now - offRouteSince) / 1000
+        android.util.Log.i("DashViewModel", "Off-route ${offSec}s → rerouting")
+        com.example.northstar.data.RideDiagnostics.log("reroute", "off-route ${offSec}s → requesting new route")
+        val startMs = System.currentTimeMillis()
         viewModelScope.launch {
             val r = Router.route(GeoPoint(loc.latitude, loc.longitude), GeoPoint(dLat, dLng))
+            val took = System.currentTimeMillis() - startMs
             if (r != null) {
                 route = r
                 progressM = 0.0
                 offRouteSince = 0L
                 tiles.prefetchRoute(r.geometry)
-                _ui.value = _ui.value.copy(hasRoute = true, routePoints = r.geometry)
+                _ui.update { it.copy(hasRoute = true, routePoints = r.geometry) }
                 android.util.Log.i("DashViewModel", "Reroute ok: ${r.geometry.size} pts, ${r.totalMeters.toInt()} m")
+                com.example.northstar.data.RideDiagnostics.log("reroute", "new route in ${took}ms (${r.geometry.size} pts, ${r.totalMeters.toInt()} m)")
             } else {
                 android.util.Log.w("DashViewModel", "Reroute failed (no internet?)")
+                com.example.northstar.data.RideDiagnostics.log("reroute", "FAILED after ${took}ms (no internet?)")
             }
             rerouting = false
         }
@@ -638,13 +1144,20 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
         // from the smoothed estimate so they don't flicker every second.
         val mins = _ui.value.etaMinutes
         val arriving = mins != null && mins <= 0
-        val etaPrimary = if (mins != null && etaArrivalMs > 0L) when {
-            arriving   -> "Arriving"
-            mins >= 60 -> "${mins / 60}h ${mins % 60}m"
-            else       -> "$mins min"
-        } else null
-        // 12-hour arrival clock; hidden once arriving.
-        val etaSecondary = if (etaPrimary != null && !arriving)
+        val recalculating = _ui.value.recalculating
+        // Off-route / rerouting: tell the rider the ETA is being recomputed instead of showing a
+        // frozen or wildly-swinging number.
+        val etaPrimary = when {
+            recalculating && route != null -> "Recalculating"
+            mins != null && etaArrivalMs > 0L -> when {
+                arriving   -> "Arriving"
+                mins >= 60 -> "${mins / 60}h ${mins % 60}m"
+                else       -> "$mins min"
+            }
+            else -> null
+        }
+        // 12-hour arrival clock; hidden once arriving or while recalculating.
+        val etaSecondary = if (etaPrimary != null && !arriving && !recalculating)
             java.text.SimpleDateFormat("h:mm a", java.util.Locale.getDefault()).format(java.util.Date(etaArrivalMs))
         else null
         val frame = MapRenderer.Frame(
@@ -669,8 +1182,60 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
             tilt3d = false,
             etaPrimary = etaPrimary,
             etaSecondary = etaSecondary,
+            gpsWeak = gpsStatus == GpsStatus.WEAK,
+            gpsLost = gpsStatus == GpsStatus.LOST,
         )
-        mapRenderer.draw(Canvas(bmp), frame)
+        val canvas = Canvas(bmp)
+        mapRenderer.draw(canvas, frame)
+        // The dash shows ONLY our video frame while projecting — it won't overlay its native
+        // now-playing/call cards (confirmed: 05 0d/05 22 are sent fine but never displayed mid-map).
+        // So we draw them INTO the frame ourselves, as the CLAUDE.md design always intended.
+        drawDashOverlays(canvas, bmp.width, bmp.height)
+        // Publish a snapshot for the in-app preview (immutable copy — see _previewFrame).
+        _previewFrame.value = bmp.copy(Bitmap.Config.ARGB_8888, false)
+    }
+
+    // Overlay paints — created once (never per-frame). ~50% smaller than the first cut, per feedback.
+    private val ovBg by lazy { android.graphics.Paint().apply { color = 0xCC0B0D0E.toInt(); isAntiAlias = true } }
+    private val ovTitle by lazy { android.graphics.Paint().apply {
+        color = android.graphics.Color.WHITE; isAntiAlias = true; textSize = 15f
+        typeface = android.graphics.Typeface.DEFAULT_BOLD; textAlign = android.graphics.Paint.Align.CENTER } }
+    private val ovSub by lazy { android.graphics.Paint().apply {
+        color = 0xFFCFCFCF.toInt(); isAntiAlias = true; textSize = 10f; textAlign = android.graphics.Paint.Align.CENTER } }
+    private val ovAccent by lazy { android.graphics.Paint().apply {
+        color = 0xFFF2A93B.toInt(); isAntiAlias = true; textSize = 10f; textAlign = android.graphics.Paint.Align.CENTER } }
+
+    /**
+     * Draw the INCOMING-call banner onto the projected frame (the dash shows only our video while
+     * projecting, so this is the only way it's visible mid-ride). Incoming only — outgoing/active
+     * calls don't set CallInfoProvider, so this never fires for them. Now-playing has no overlay; it
+     * goes to the dash's audio screen via the 05 0d TLV instead. Centred in the round display's safe zone.
+     */
+    private fun drawDashOverlays(canvas: Canvas, w: Int, h: Int) {
+        val call = com.example.northstar.media.CallInfoProvider.incomingCall.value
+        if (call == null || !call.incoming) return   // overlay only for a ringing call, not active/outgoing
+        val cx = w / 2f; val cy = h / 2f
+        val half = h * 0.28f   // ~half the previous width; stays inside the round display
+        canvas.drawRoundRect(cx - half, cy - 26f, cx + half, cy + 26f, 10f, 10f, ovBg)
+        canvas.drawText("Incoming call", cx, cy - 11f, ovSub)
+        canvas.drawText(ellipsizeOverlay(call.caller, 16), cx, cy + 5f, ovTitle)
+        canvas.drawText("UP answer · DOWN reject", cx, cy + 19f, ovAccent)
+    }
+
+    private fun ellipsizeOverlay(s: String, max: Int) = if (s.length > max) s.take(max - 1) + "…" else s
+
+    /** Answer via the dialer's own notification action (most reliable); fall back to TelecomManager. */
+    private fun answerCall(c: com.example.northstar.media.IncomingCall) {
+        val sent = c.answerIntent?.let { runCatching { it.send() }.isSuccess } ?: false
+        if (!sent) callController.answer()
+        com.example.northstar.data.RideDiagnostics.log("media", "answer (notifAction=$sent)")
+    }
+
+    /** Reject (ringing) or hang up (active) via the dialer's action; fall back to TelecomManager. */
+    private fun endCall(c: com.example.northstar.media.IncomingCall) {
+        val sent = c.declineIntent?.let { runCatching { it.send() }.isSuccess } ?: false
+        if (!sent) callController.hangup()
+        com.example.northstar.data.RideDiagnostics.log("media", "end/reject (notifAction=$sent)")
     }
 
     // ── Monotonic route-progress tracker ────────────────────────────────────
@@ -731,7 +1296,7 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
             PowerManager.THERMAL_STATUS_SEVERE, PowerManager.THERMAL_STATUS_CRITICAL -> "Hot"
             else -> "Throttling"
         }
-        if (label != _ui.value.thermal) _ui.value = _ui.value.copy(thermal = label)
+        if (label != _ui.value.thermal) _ui.update { it.copy(thermal = label) }
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -744,19 +1309,64 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
     private fun fmtDist(m: Double): String =
         if (m < 1000) "${m.toInt()} m" else "%.1f km".format(m / 1000.0)
 
+    /** Smallest absolute angle (0..180°) between two compass bearings. */
+    private fun angleDelta(a: Float, b: Float): Float {
+        val d = (((a - b) % 360f) + 540f) % 360f - 180f
+        return kotlin.math.abs(d)
+    }
+
     private fun teardown() {
         streamJob?.cancel(); streamJob = null
+        stopMediaForwarding()
         encoder?.release(); encoder = null
         frameBitmap?.recycle(); frameBitmap = null
+        _previewFrame.value = null   // drop the stale dash frame so the preview falls back to the live map
+    }
+
+    /**
+     * Bridge the phone's now-playing session + incoming-call notification onto the dash (TLV 05 0d /
+     * 05 22), matching the dash. Needs notification access; without it MediaInfoProvider
+     * stays silent and the dash simply shows no media card. Album art (05 40) is captured in the
+     * protocol but not auto-sent yet (fragmentation unverified — see DashCommands.albumArtFrames).
+     */
+    private fun startMediaForwarding() {
+        val granted = com.example.northstar.media.MediaInfoProvider.isAccessGranted(getApplication())
+        com.example.northstar.data.RideDiagnostics.log("media", "forwarding start — notification access=$granted")
+        mediaInfo.start()
+        mediaObserveJob?.cancel()
+        mediaObserveJob = viewModelScope.launch {
+            launch {
+                mediaInfo.nowPlaying.collect { np ->
+                    com.example.northstar.data.RideDiagnostics.log("media", "now-playing observed: ${np?.title ?: "(none)"}")
+                    session.updateNowPlaying(np?.title, np?.album.orEmpty(), np?.artist.orEmpty())
+                }
+            }
+            launch {
+                com.example.northstar.media.CallInfoProvider.incomingCall.collect { call ->
+                    com.example.northstar.data.RideDiagnostics.log("media", "call observed: ${call?.caller ?: "(none)"}")
+                    session.updateCall(call?.caller)
+                }
+            }
+        }
+    }
+
+    private fun stopMediaForwarding() {
+        mediaObserveJob?.cancel(); mediaObserveJob = null
+        mediaInfo.stop()
+        session.updateNowPlaying(null, "", "")
+        session.updateCall(null)
     }
 
     override fun onCleared() {
         super.onCleared()
         stopRecording()        // save the in-progress ride if the app is closed mid-session
-        teardown()
         session.disconnect()
         wifiManager.disconnect()
-        location.stop()
+        // Streaming can't continue once the ViewModel is gone, so make sure the foreground
+        // service + wake/wifi locks + GPS don't outlive it (otherwise they'd hold the CPU/WiFi
+        // awake with nothing producing frames).
+        releaseBackgroundResources()
         voice.shutdown()
+        com.example.northstar.data.RideDiagnostics.stop("app closed")
     }
 }

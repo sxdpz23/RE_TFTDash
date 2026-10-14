@@ -1,7 +1,10 @@
 package com.example.northstar.ui.screens
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -15,6 +18,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.northstar.ui.NorthstarIcons
@@ -22,16 +28,21 @@ import com.example.northstar.ui.components.*
 import com.example.northstar.ui.theme.*
 import com.example.northstar.viewmodel.AuthViewModel
 import com.example.northstar.viewmodel.ConnectionState
+import com.example.northstar.viewmodel.DashViewModel
+import kotlinx.coroutines.launch
 
 @Composable
 fun SettingsScreen(
     conn: ConnectionState,
     onConnChange: (ConnectionState) -> Unit,
     authViewModel: AuthViewModel,
+    dashViewModel: DashViewModel,
     onSignedOut: () -> Unit,
     onBack: () -> Unit,
 ) {
     val auth by authViewModel.state.collectAsState()
+    val dashUi by dashViewModel.ui.collectAsState()
+    var showSwitchDialog by remember { mutableStateOf(false) }
     val email = auth.email ?: "Not signed in"
     val initials = remember(auth.email, auth.displayName) {
         val src = auth.displayName?.takeIf { it.isNotBlank() } ?: auth.email ?: "?"
@@ -60,7 +71,8 @@ fun SettingsScreen(
             .padding(18.dp)
             .padding(bottom = 24.dp),
     ) {
-        ScreenHeader(title = "Settings", onBack = onBack)
+        ScreenHeader(title = "Settings", onBack = onBack,
+            hint = "Connection, screen-off streaming, voice guidance, units, and media/call permissions.")
 
         // Account card
         NorthstarCard(modifier = Modifier.fillMaxWidth(), padding = 16.dp, onClick = {}) {
@@ -90,11 +102,44 @@ fun SettingsScreen(
                 sub = when (conn) { ConnectionState.Connected -> "Connected"; ConnectionState.Searching -> "Connecting…"; ConnectionState.Offline -> "Not connected" },
                 control = { NorthstarChip(if (conn == ConnectionState.Connected) "Linked" else "Off", if (conn == ConnectionState.Connected) ChipTone.Gold else ChipTone.Off, dot = true) })
             NorthstarDivider(Modifier.padding(horizontal = 6.dp))
+            // Switch to a different bike's dash. The app pins to the first dash it pairs with; this
+            // forgets it so the next connect re-discovers and pairs with whichever RE dash is nearby.
+            SettingRow(NorthstarIcons.Motor, "Switch bike",
+                sub = if (dashUi.ssid.isNotBlank()) "Paired: ${dashUi.ssid} · tap to pair a different dash"
+                      else "Not paired — pairs with any nearby Royal Enfield dash",
+                control = { Icon(NorthstarIcons.ChevronRight, null, tint = TextLo, modifier = Modifier.size(18.dp)) },
+                onClick = if (dashUi.ssid.isNotBlank()) ({ showSwitchDialog = true }) else null)
+            NorthstarDivider(Modifier.padding(horizontal = 6.dp))
             SettingRow(NorthstarIcons.Sync, "Auto-connect on start", "Link when the bike is near",
                 control = { NorthstarToggle(autoConnect) { autoConnect = it } })
             NorthstarDivider(Modifier.padding(horizontal = 6.dp))
             SettingRow(NorthstarIcons.Zap, "Stream quality", "Balanced · saves battery",
                 control = { Icon(NorthstarIcons.ChevronRight, null, tint = TextLo, modifier = Modifier.size(18.dp)) }, last = true)
+        }
+
+        if (showSwitchDialog) {
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = { showSwitchDialog = false },
+                title = { Text("Switch to another bike?") },
+                text = {
+                    Text(
+                        "This forgets the paired dash" +
+                            (if (dashUi.ssid.isNotBlank()) " (${dashUi.ssid})" else "") +
+                            ". The next connection pairs with whichever Royal Enfield dash is nearby — " +
+                            "do it next to the other bike, with its dash on.",
+                    )
+                },
+                confirmButton = {
+                    androidx.compose.material3.TextButton(onClick = {
+                        dashViewModel.disconnect()
+                        dashViewModel.forgetDash()
+                        showSwitchDialog = false
+                    }) { Text("Forget & switch", color = Gold) }
+                },
+                dismissButton = {
+                    androidx.compose.material3.TextButton(onClick = { showSwitchDialog = false }) { Text("Cancel") }
+                },
+            )
         }
 
         SectionLabel("During a ride")
@@ -104,6 +149,63 @@ fun SettingsScreen(
             NorthstarDivider(Modifier.padding(horizontal = 6.dp))
             SettingRow(NorthstarIcons.Dash, "Keep dash awake", "Prevent Tripper sleep",
                 control = { NorthstarToggle(keepAwake) { keepAwake = it } }, last = true)
+        }
+
+        SectionLabel("Media & calls on dash")
+        // Re-check the grant on ON_RESUME so the chip flips to "On" the moment the user comes back
+        // from the system notification-access screen (the Settings value isn't observable on its own).
+        val lifecycleOwner = LocalLifecycleOwner.current
+        fun answerGranted() = androidx.core.content.ContextCompat.checkSelfPermission(
+            ctx, android.Manifest.permission.ANSWER_PHONE_CALLS,
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        var mediaGranted by remember { mutableStateOf(com.example.northstar.media.MediaInfoProvider.isAccessGranted(ctx)) }
+        var callAnswerGranted by remember { mutableStateOf(answerGranted()) }
+        DisposableEffect(lifecycleOwner) {
+            val obs = LifecycleEventObserver { _, e ->
+                if (e == Lifecycle.Event.ON_RESUME) {
+                    mediaGranted = com.example.northstar.media.MediaInfoProvider.isAccessGranted(ctx)
+                    callAnswerGranted = answerGranted()
+                }
+            }
+            lifecycleOwner.lifecycle.addObserver(obs)
+            onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
+        }
+        val callPermLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+            callAnswerGranted = it
+        }
+        NorthstarCard(modifier = Modifier.fillMaxWidth(), padding = 6.dp) {
+            SettingRow(
+                NorthstarIcons.Zap,
+                "Now playing & calls on dash",
+                if (mediaGranted) "Enabled · song info + caller shown while riding"
+                else "Tap to allow notification access",
+                control = {
+                    NorthstarChip(
+                        if (mediaGranted) "On" else "Enable",
+                        if (mediaGranted) ChipTone.Gold else ChipTone.Off, dot = true,
+                    )
+                },
+                onClick = if (mediaGranted) null else {
+                    { runCatching { ctx.startActivity(com.example.northstar.media.MediaInfoProvider.accessSettingsIntent()) } }
+                },
+            )
+            NorthstarDivider(Modifier.padding(horizontal = 6.dp))
+            SettingRow(
+                NorthstarIcons.Bt,
+                "Answer calls from joystick",
+                if (callAnswerGranted) "Enabled · UP answers, DOWN rejects"
+                else "Tap to allow answering/rejecting calls",
+                control = {
+                    NorthstarChip(
+                        if (callAnswerGranted) "On" else "Enable",
+                        if (callAnswerGranted) ChipTone.Gold else ChipTone.Off, dot = true,
+                    )
+                },
+                last = true,
+                onClick = if (callAnswerGranted) null else {
+                    { callPermLauncher.launch(android.Manifest.permission.ANSWER_PHONE_CALLS) }
+                },
+            )
         }
 
         SectionLabel("Voice & guidance")
@@ -152,11 +254,96 @@ fun SettingsScreen(
             Spacer(Modifier.height(6.dp))
         }
 
+        TestBuildCard()
+
+        val appVersion = remember { com.example.northstar.data.UpdateChecker.currentVersionName(ctx) }
         Text(
-            "NORTHSTAR v1.0 · ${if (!auth.syncAvailable) "local only" else if (auth.isSignedIn) "sync on" else "sync off"}",
+            "NORTHSTAR v$appVersion · ${if (!auth.syncAvailable) "local only" else if (auth.isSignedIn) "sync on" else "sync off"}",
             color = TextDis, fontSize = 11.sp, fontFamily = GeistMonoFamily,
             modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 10.dp),
         )
+        Text(
+            "Independent community project — not affiliated with, endorsed by, or supported by " +
+                "Royal Enfield. \"Royal Enfield\", \"Himalayan\" and \"Tripper\" are trademarks of " +
+                "their respective owners, used here only to describe compatible hardware. The dash " +
+                "link is unofficial and exists solely for interoperability with hardware you own — use at your own risk.",
+            color = TextDis, fontSize = 10.sp, fontFamily = GeistFamily,
+            modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 8.dp, start = 8.dp, end = 8.dp),
+        )
+    }
+}
+
+/**
+ * Test-build channel: installs a freshly pushed APK WITHOUT a version bump. Compares the running
+ * APK's CHECKSUM against the published one (Firestore `meta/test_build`) and, if they differ,
+ * offers a one-tap download+install (same signing key → installs in place, keeping data). Checksum
+ * means it's correct however the build was installed, and the card clears itself once the matching
+ * APK is running. Invisible when up to date / no build published / Firebase off.
+ */
+@Composable
+private fun TestBuildCard() {
+    // Debug-channel only: the test-build installer must never appear in a public release build.
+    if (!com.example.northstar.BuildConfig.DEBUG) return
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var build by remember { mutableStateOf<com.example.northstar.data.TestBuildChecker.TestBuild?>(null) }
+    var status by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var checking by remember { mutableStateOf(true) }
+
+    suspend fun refresh() {
+        checking = true
+        build = com.example.northstar.data.TestBuildChecker.fetchLatest(ctx)
+        checking = false
+    }
+    LaunchedEffect(Unit) { refresh() }
+
+    val b = build
+    // Nothing published, or the running APK already matches the published checksum → no card.
+    if (b == null || !com.example.northstar.data.TestBuildChecker.needsInstall(ctx, b)) return
+
+    fun installNow() {
+        busy = true; status = "Downloading…"
+        scope.launch {
+            val file = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                com.example.northstar.data.UpdateChecker.download(ctx, b.url) { p ->
+                    status = "Downloading… ${(p * 100).toInt()}%"
+                }
+            }
+            if (file == null) { status = "Download failed — try again"; busy = false; return@launch }
+            status = "Opening installer…"
+            // No bookkeeping needed: once the new APK is running its checksum matches the published
+            // one, so needsInstall() returns false and this card disappears on its own.
+            val started = com.example.northstar.data.UpdateChecker.install(ctx, file)
+            if (!started) status = "Allow “install unknown apps”, then tap again"
+            busy = false
+        }
+    }
+
+    NorthstarCard(modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f).padding(end = 12.dp)) {
+                Text("New test build", color = Gold, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                Text(
+                    buildString {
+                        append(b.builtAt.ifBlank { b.buildId })
+                        if (b.sizeBytes > 0) append(" · ${b.sizeBytes / (1024 * 1024)} MB")
+                    },
+                    color = TextMid, fontSize = 12.sp, modifier = Modifier.padding(top = 3.dp),
+                )
+                if (b.notes.isNotBlank())
+                    Text(b.notes, color = TextLo, fontSize = 11.5.sp, modifier = Modifier.padding(top = 2.dp))
+                if (status.isNotBlank())
+                    Text(status, color = TextLo, fontSize = 11.sp, fontFamily = GeistMonoFamily, modifier = Modifier.padding(top = 4.dp))
+            }
+            NorthstarBtn(
+                if (busy) "…" else "Install",
+                onClick = { if (!busy) installNow() },
+                icon = NorthstarIcons.Wifi,
+                variant = BtnVariant.Primary,
+                size = BtnSize.Sm,
+            )
+        }
     }
 }
 
@@ -172,10 +359,14 @@ private fun SettingRow(
     sub: String? = null,
     control: @Composable () -> Unit,
     last: Boolean = false,
+    onClick: (() -> Unit)? = null,
 ) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 13.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .let { if (onClick != null) it.clickable(onClick = onClick) else it }
+            .padding(horizontal = 6.dp, vertical = 13.dp),
     ) {
         Box(
             contentAlignment = Alignment.Center,

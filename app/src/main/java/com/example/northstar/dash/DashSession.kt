@@ -2,6 +2,7 @@ package com.example.northstar.dash
 
 import android.util.Log
 import com.example.northstar.dash.protocol.DashCommands
+import com.example.northstar.util.Dbg
 import com.example.northstar.dash.protocol.K1GPacket
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -24,8 +25,18 @@ class DashSession(private val scope: CoroutineScope) {
         private const val TAG           = "DashSession"
         private const val AUTH_TIMEOUT  = 15_000L
         private const val BURST_PAUSE   = 20L
-        private const val PROJ_HB_MS     = 250L   // 4 Hz
+        // Projection control keep-alive (a TLV, NOT the video). Now that the video cadence is
+        // motion-adaptive (250 ms active / 500 ms idle, RE-style), this is a STEADY keep-alive pinned
+        // to the fast video interval — i.e. always sent at least as often as a video frame, never
+        // slower. That's the safe direction (the dash's projection state never starves). The protocol trace for
+        // the dash will confirm whether RE couples its equivalent control packet to the
+        // video rate; if it runs slower, raise this. Was 42 ms (24 Hz) to match the old fixed loop.
+        private const val PROJ_HB_MS     = 250L   // 4 Hz — matches FRAME_MS_ACTIVE (the fastest video rate)
         private const val ROUTE_CARD_MS  = 1_000L // 1 Hz keep-alive
+        // While streaming, the dash sends a frame-decoded ack (09 06/04 55) every frame. If those
+        // STOP for this long the dash is gone (out of range / powered off) — but over UDP there's no
+        // socket error, so without this watchdog the app streams into the void showing "connected".
+        private const val RX_WATCHDOG_MS = 6_000L
         private const val HOSTNAME       = "Northstar"
     }
 
@@ -36,6 +47,11 @@ class DashSession(private val scope: CoroutineScope) {
     private var auth: DashAuth? = null
     @Volatile private var authConfirmed = false
     @Volatile private var authRetries = 0
+    // Wall-clock of the last packet received from the dash — fed to the RX watchdog.
+    @Volatile private var lastRxMs = 0L
+    // One-shot: the first time the dash reports it DECODED our video (09 06 55). If this never
+    // appears in the ride log, the dash never accepted the stream — the likely "Timeout!" cause.
+    @Volatile private var loggedFirstAck = false
 
     var onButton: ((Byte) -> Unit)? = null
     var onError:  ((String) -> Unit)? = null
@@ -48,6 +64,24 @@ class DashSession(private val scope: CoroutineScope) {
     private var routeCardJob: Job? = null
     private var heartbeatJob: Job? = null
     private var navInfoJob: Job? = null
+    private var mediaInfoJob: Job? = null
+
+    // Now-playing + incoming-call pushed to the dash at ~1 Hz (mirrors the dash's05 0d / 05 22 cadence).
+    // Strings, not the media model, so the protocol layer stays decoupled from the media provider.
+    @Volatile private var npTitle: String? = null
+    @Volatile private var npAlbum = ""
+    @Volatile private var npArtist = ""
+    @Volatile private var caller: String? = null
+
+    /** Push the latest now-playing metadata; sent to the dash at 1 Hz while streaming (null title = hide). */
+    fun updateNowPlaying(title: String?, album: String, artist: String) {
+        npTitle = title?.takeIf { it.isNotBlank() }
+        npAlbum = album
+        npArtist = artist
+    }
+
+    /** Push the current incoming-call caller name (null clears it). */
+    fun updateCall(callerName: String?) { caller = callerName?.takeIf { it.isNotBlank() } }
 
     // Live nav-info pushed to the dash bubble at ~1 Hz (set by NavEngine output).
     @Volatile private var navManeuver = DashCommands.NAV_MANEUVER_CONTINUE
@@ -104,6 +138,7 @@ class DashSession(private val scope: CoroutineScope) {
         launchProjectionHeartbeat()
         launchRouteCardKeepAlive()
         launchNavInfo()
+        launchMediaInfo()
     }
 
     fun sendRtp(packet: ByteArray) { socket?.sendRtp(packet) }
@@ -122,7 +157,7 @@ class DashSession(private val scope: CoroutineScope) {
         // Cancel the session coroutine FIRST so it can't race past auth and flip state to
         // READY after we tear down (which would re-trigger streaming on a dead socket).
         sessionJob?.cancel(); sessionJob = null
-        rxJob?.cancel(); projHbJob?.cancel(); routeCardJob?.cancel(); heartbeatJob?.cancel(); navInfoJob?.cancel()
+        rxJob?.cancel(); projHbJob?.cancel(); routeCardJob?.cancel(); heartbeatJob?.cancel(); navInfoJob?.cancel(); mediaInfoJob?.cancel()
         navActive = false
         socket?.let {
             runCatching { it.send(DashCommands.projectionStop()) }
@@ -149,6 +184,8 @@ class DashSession(private val scope: CoroutineScope) {
             auth = DashAuth(ssid)
             authConfirmed = false
             authRetries = 0
+            loggedFirstAck = false
+            lastRxMs = 0L
 
             // RX loop MUST be running before the burst (early pubkey + no ICMP).
             launchReceiveLoop(sock)
@@ -161,6 +198,7 @@ class DashSession(private val scope: CoroutineScope) {
                 sock.send(pkt)
                 delay(BURST_PAUSE)
             }
+            com.example.northstar.data.RideDiagnostics.log("auth", "initial burst sent — waiting up to ${AUTH_TIMEOUT}ms for 07 01 01")
 
             Log.i(TAG, "Waiting up to ${AUTH_TIMEOUT}ms for auth (07 01 01)…")
             val deadline = System.currentTimeMillis() + AUTH_TIMEOUT
@@ -171,10 +209,12 @@ class DashSession(private val scope: CoroutineScope) {
                 return
             }
             Log.i(TAG, "Authenticated ✓")
+            com.example.northstar.data.RideDiagnostics.log("auth", "authenticated (07 01 01) — entering nav mode")
 
             enterNavMode(sock)
             _state.value = DashState.READY
             Log.i(TAG, "READY ✓")
+            com.example.northstar.data.RideDiagnostics.log("session", "nav-mode kick sent — READY (waiting for video pipeline)")
 
         } catch (e: Exception) {
             Log.e(TAG, "Session error", e)
@@ -183,7 +223,7 @@ class DashSession(private val scope: CoroutineScope) {
     }
 
     /**
-     * Nav entry in the exact phone order (nav_open_ok.pcap):
+     * Nav entry in the exact phone order (the observed nav-open order):
      *   route-card ×4 (establishes destination) → projectionFrame
      *   → z2 once → route-card confirmation.
      */
@@ -213,9 +253,11 @@ class DashSession(private val scope: CoroutineScope) {
                     // Link dropped (EBADF/ENETUNREACH) — end the loop cleanly instead of
                     // crashing the app; DashWifiManager handles reconnect.
                     Log.w(TAG, "RX loop stopped — socket error: ${e.message}")
+                    com.example.northstar.data.RideDiagnostics.log("error", "RX loop stopped — socket error: ${e.message}")
                     onError?.invoke("Lost connection to dash")
                     break
                 } ?: continue
+                lastRxMs = System.currentTimeMillis()
                 dispatchIncoming(pkt, sock)
             }
         }
@@ -231,19 +273,21 @@ class DashSession(private val scope: CoroutineScope) {
             it.type == 0x09 && (it.sub == 0x06 || it.sub == 0x04) &&
                 it.value.firstOrNull()?.toInt() == 0x55
         }
-        if (!onlyAcks) Log.i(TAG, "RX RAW (${pkt.size}B): ${pkt.toHexFull()}")
+        if (!onlyAcks) Dbg.i(TAG) { "RX RAW (${pkt.size}B): ${pkt.toHexFull()}" }
         for (tlv in tlvs) {
             // ── Auth (07 xx) ──
             if (tlv.type == 0x07) {
                 when (val ev = auth?.ingest(tlv)) {
                     is AuthEvent.SendKey -> {
                         Log.i(TAG, "Got RSA pubkey — sending q3c.d")
+                        com.example.northstar.data.RideDiagnostics.log("auth", "RSA pubkey received → sending session key (q3c.d)")
                         sock.send(ev.packet)
                     }
                     AuthEvent.Confirmed -> { authConfirmed = true }
                     AuthEvent.Rejected -> {
                         authRetries++
                         Log.w(TAG, "Auth rejected — retry #$authRetries")
+                        com.example.northstar.data.RideDiagnostics.log("auth", "REJECTED — retry #$authRetries")
                         auth?.reset()
                         if (authRetries <= 5) sock.send(DashCommands.authRequest())
                     }
@@ -255,6 +299,10 @@ class DashSession(private val scope: CoroutineScope) {
             if (tlv.type == 0x09 && tlv.sub == 0x06 &&
                 tlv.value.firstOrNull()?.toInt() == 0x55
             ) {
+                if (!loggedFirstAck) {
+                    loggedFirstAck = true
+                    com.example.northstar.data.RideDiagnostics.log("dash", "dash DECODED first IDR (09 06 55) — video accepted ✓")
+                }
                 sock.send(DashCommands.frameDecodedIdr())
                 continue
             }
@@ -279,7 +327,7 @@ class DashSession(private val scope: CoroutineScope) {
             //    logs these as ciphertext — we actually DECRYPT with our session key
             //    and log the plaintext for field-mapping (P1b). It arrives over our
             //    own session, so plain `adb logcat -s DashSession` captures it — no
-            //    root, no monitor mode. ──
+            //    root, no extra logging. ──
             if (tlv.type == 0x0F) {
                 val key = auth?.sessionKey
                 val plain = key?.let { aesDecryptCbc(tlv.value, it) }
@@ -309,6 +357,18 @@ class DashSession(private val scope: CoroutineScope) {
                 runCatching { sock.send(DashCommands.heartbeat()) }
                 // Keep the dash clock correct — it only shows what the phone feeds it.
                 if (n++ % 30 == 0) runCatching { sock.send(DashCommands.timeSync()) }
+                // RX watchdog: once the dash has acked at least one frame, a long silence means it
+                // dropped (out of range / off). UDP gives no error, so detect it here and fail the
+                // session instead of streaming into the void while the UI still says "connected".
+                if (_state.value == DashState.STREAMING && loggedFirstAck &&
+                    lastRxMs > 0L && System.currentTimeMillis() - lastRxMs > RX_WATCHDOG_MS
+                ) {
+                    val silent = (System.currentTimeMillis() - lastRxMs) / 1000
+                    Log.w(TAG, "RX watchdog: no dash packets for ${silent}s — link lost")
+                    com.example.northstar.data.RideDiagnostics.log("error", "RX watchdog: dash silent ${silent}s → link lost")
+                    fail("Dash stopped responding — connection lost")
+                    break
+                }
                 delay(1_000)
             }
         }
@@ -354,8 +414,41 @@ class DashSession(private val scope: CoroutineScope) {
         }
     }
 
+    /**
+     * Now-playing (05 0d) + incoming-call (05 22) keep-alive, ~1 Hz — the cadence the dash
+     * used on the wire. Both must REPEAT (the dash drops a card it stops hearing about). Call card is
+     * sent whenever a caller is set; cleared once on the ringing→idle transition.
+     */
+    private fun launchMediaInfo() {
+        mediaInfoJob?.cancel()
+        mediaInfoJob = scope.launch(Dispatchers.IO) {
+            var prevCaller: String? = null
+            var loggedNp = false
+            var loggedCall = false
+            while (isActive && _state.value == DashState.STREAMING) {
+                val c = caller
+                when {
+                    c != null -> {
+                        runCatching { socket?.send(DashCommands.callNotify(c)) }
+                        if (!loggedCall) { loggedCall = true
+                            com.example.northstar.data.RideDiagnostics.log("media", "TX call card 05 22: $c") }
+                    }
+                    prevCaller != null -> { runCatching { socket?.send(DashCommands.callClear()) }; loggedCall = false }
+                }
+                prevCaller = c
+                npTitle?.let {
+                    runCatching { socket?.send(DashCommands.nowPlaying(it, npAlbum, npArtist)) }
+                    if (!loggedNp) { loggedNp = true
+                        com.example.northstar.data.RideDiagnostics.log("media", "TX now-playing 05 0d: $it") }
+                }
+                delay(ROUTE_CARD_MS)
+            }
+        }
+    }
+
     private fun fail(msg: String) {
         Log.e(TAG, "ERROR — $msg")
+        com.example.northstar.data.RideDiagnostics.log("error", "session fail: $msg")
         rxJob?.cancel(); heartbeatJob?.cancel()
         socket?.close(); socket = null
         _state.value = DashState.ERROR

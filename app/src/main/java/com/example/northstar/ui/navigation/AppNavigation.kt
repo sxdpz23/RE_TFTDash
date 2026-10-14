@@ -64,6 +64,33 @@ fun AppNavigation(
     val navController = rememberNavController()
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = navBackStackEntry?.destination?.route
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+
+    // Analytics screen_view per destination. A single-Activity Compose app doesn't auto-log these,
+    // so feed each nav route to Analytics — that's what makes per-feature usage (and time spent on
+    // each screen) visible. No-op when Firebase isn't configured.
+    LaunchedEffect(currentRoute) {
+        currentRoute?.let { com.example.northstar.util.Telemetry.logScreen(it) }
+    }
+
+    // Navigate to a top-level destination with ONE consistent pattern — whether the tap came from
+    // the bottom bar or a Home-screen button. The Home button used to do a plain navigate() while
+    // the bottom bar used saveState/restoreState; mixing them corrupted the back stack so that,
+    // after opening Dash from the Home button, tapping Home did nothing (target == start
+    // destination + a restoreState mismatch). Routing both through this fixes it.
+    fun navigateTab(route: String) {
+        navController.navigate(route) {
+            popUpTo(navController.graph.findStartDestination().id) { saveState = true }
+            launchSingleTop = true
+            restoreState = true
+        }
+    }
+
+    // Skip the login screen on every cold start once the rider has passed it (signed in OR chose
+    // "continue locally"); cleared on sign-out so it returns. Remembered once, read here.
+    val startDest = remember {
+        if (com.example.northstar.data.AuthPrefs.isOnboarded(ctx)) Screen.Home.route else Screen.Login.route
+    }
 
     val showBottomNav = currentRoute in listOf(
         Screen.Home.route, Screen.Route.route, Screen.Dash.route,
@@ -75,11 +102,21 @@ fun AppNavigation(
 
     // Single source of truth for connection status: the real dash stage. Fixes Home
     // claiming "Connected" while the Dash screen says it isn't.
-    val dashUi by dashViewModel.ui.collectAsState()
-    val conn = when (dashUi.stage) {
-        ConnStage.STREAMING -> ConnectionState.Connected
-        ConnStage.WIFI, ConnStage.AUTH -> ConnectionState.Searching
-        else -> ConnectionState.Offline
+    //
+    // IMPORTANT: collect WITHOUT reading the state in the composable body. While streaming,
+    // dashViewModel.ui updates ~15×/s (frame counter, rider position…). Reading it directly here
+    // recomposed the entire nav scaffold 15×/s, which starved/janked the bottom-nav tabs — you
+    // couldn't open Home while connected. derivedStateOf re-evaluates cheaply but only recomposes
+    // readers when `conn` actually changes (i.e. when the STAGE changes).
+    val dashUiState = dashViewModel.ui.collectAsState()
+    val conn by remember {
+        derivedStateOf {
+            when (dashUiState.value.stage) {
+                ConnStage.STREAMING -> ConnectionState.Connected
+                ConnStage.WIFI, ConnStage.AUTH -> ConnectionState.Searching
+                else -> ConnectionState.Offline
+            }
+        }
     }
 
     // Prefetch map tiles the moment a destination resolves (internet still reachable here)
@@ -102,17 +139,19 @@ fun AppNavigation(
         Box(Modifier.weight(1f)) {
             NavHost(
                 navController = navController,
-                startDestination = Screen.Login.route,
+                startDestination = startDest,
             ) {
                 composable(Screen.Login.route) {
                     LoginScreen(
                         authViewModel = authViewModel,
                         onSignedIn = {
+                            com.example.northstar.data.AuthPrefs.setOnboarded(ctx, true)
                             navController.navigate(Screen.Home.route) {
                                 popUpTo(Screen.Login.route) { inclusive = true }
                             }
                         },
                         onSkip = {
+                            com.example.northstar.data.AuthPrefs.setOnboarded(ctx, true)
                             navController.navigate(Screen.Home.route) {
                                 popUpTo(Screen.Login.route) { inclusive = true }
                             }
@@ -125,9 +164,12 @@ fun AppNavigation(
                         conn = conn,
                         onNavigate = { dest ->
                             when (dest) {
-                                "route" -> navController.navigate(Screen.Route.route)
-                                "dash" -> navController.navigate(Screen.Dash.route)
-                                "garage" -> navController.navigate(Screen.Garage.route)
+                                // Top-level destinations go through the shared tab navigation so the
+                                // back stack stays consistent with the bottom bar (see navigateTab).
+                                "route" -> navigateTab(Screen.Route.route)
+                                "dash" -> navigateTab(Screen.Dash.route)
+                                "garage" -> navigateTab(Screen.Garage.route)
+                                // Settings is a detail screen (its own back), not a tab.
                                 "settings" -> navController.navigate(Screen.Settings.route)
                             }
                         },
@@ -175,7 +217,9 @@ fun AppNavigation(
                         conn = conn,
                         onConnChange = { appViewModel.setConn(it) },
                         authViewModel = authViewModel,
+                        dashViewModel = dashViewModel,
                         onSignedOut = {
+                            com.example.northstar.data.AuthPrefs.setOnboarded(ctx, false)
                             navController.navigate(Screen.Login.route) {
                                 popUpTo(0) { inclusive = true }
                             }
@@ -186,16 +230,14 @@ fun AppNavigation(
             }
         }
 
+        // Checks GitHub Releases on app open; shows an update dialog only if a newer
+        // version is published. Renders nothing otherwise.
+        com.example.northstar.ui.components.UpdatePrompt()
+
         if (showBottomNav) {
             NorthstarBottomNav(
                 currentRoute = currentRoute,
-                onNavSelect = { screen ->
-                    navController.navigate(screen.route) {
-                        popUpTo(navController.graph.findStartDestination().id) { saveState = true }
-                        launchSingleTop = true
-                        restoreState = true
-                    }
-                },
+                onNavSelect = { screen -> navigateTab(screen.route) },
             )
         }
     }

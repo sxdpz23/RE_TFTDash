@@ -1,47 +1,50 @@
-    # Northstar
+# Northstar
 
-Personal Android companion app for a **Royal Enfield Himalayan 450** motorcycle.
-Single user (just me), Android-only, targeting a **Nothing Phone 3**. Not a
-product to sell — may be open-sourced, but built for my own bike only. No user
-personas, no client/enterprise concerns.
+Personal Android companion app for a **Royal Enfield Himalayan 450** motorcycle,
+designed to work with the bike's **Tripper** dash. Single user, Android-only,
+targeting a **Nothing Phone 3**. Built for the author's own bike; may be
+open-sourced. No user personas, no client/enterprise concerns.
+
+> Independent project, not affiliated with or endorsed by Royal Enfield. "Royal
+> Enfield", "Himalayan", and "Tripper" are trademarks of their owners, used here
+> only to describe compatible hardware. The dash link is an unofficial
+> interoperability feature for hardware the user already owns.
 
 ## Primary goal
 
-Low-power **navigation projected onto the Royal Enfield Tripper Dash** (a small
-**round TFT display**) without cooking the phone. The Royal Enfield app overheats
-the phone because it screen-*projects* — it keeps the OLED lit and mirrors Google
-Maps. Northstar instead **renders the map off-screen and hardware-encodes H.264**, so
-the phone screen can stay **OFF** during the ride. That single architectural
-difference is the whole point of the project.
+Low-power **navigation shown on the Tripper dash** (a small **round TFT display**)
+without cooking the phone. Northstar **renders the map off-screen and
+hardware-encodes H.264**, so the phone screen can stay **OFF** during the ride.
+That single architectural choice — keeping the screen off — is the whole point of
+the project.
 
-## Dash protocol
+## Dash link
 
-- Connect to the Tripper Dash using the **better-dash** protocol as reference:
+- Talks to the Tripper dash over Wi-Fi using its documented behaviour; the
+  open-source **better-dash** project (Apache-2.0) is used as a reference:
   https://github.com/norbertFeron/better-dash
-- After an auth handshake, the dash decodes an **H.264/RTP stream over UDP port
-  5000**. It does not care what produces the video.
-- **Unverified against my hardware:** the handshake/connection details vary by
-  firmware. My dash runs firmware **11.63** — the control-plane + auth must be
-  validated against it before anything else is trusted. This is the make-or-break
-  gate; treat it as Phase 1, step 1.
+- After a handshake, the dash decodes an **H.264/RTP stream over UDP port 5000**.
+  It does not care what produces the video.
+- Dash behaviour varies by firmware. The author's dash runs firmware **11.63** —
+  the link layer is validated against it before anything else is relied on.
+  Treat that as Phase 1, step 1.
 
 ## Core user flow
 
-1. I share a destination from **Google Maps** into Northstar.
-2. Northstar previews the route, I tap **Send to Dash**.
-3. While riding, the dash shows the map; I use the bike's **physical joystick** to
-   pan/zoom. The phone screen stays off.
+1. Share a destination from **Google Maps** into Northstar.
+2. Northstar previews the route, tap **Send to Dash**.
+3. While riding, the dash shows the map; the bike's **physical joystick**
+   pans/zooms. The phone screen stays off.
 
 ## Tech stack
 
 - **Language:** Kotlin (Android, native).
 - **Map rendering:** off-screen render → `MediaCodec` hardware H.264 encode →
   `MediaCodec`/RTP to the dash on UDP/5000.
-- **Maps/offline:** offline maps preferred for riding; reuse cached/offline Google
-  Maps if feasible, otherwise an OSM stack (MapLibre) as fallback. Decide during
-  build — don't over-engineer the map layer up front.
+- **Maps/offline:** offline maps preferred for riding; an OSM stack (MapLibre).
+  Decide during build — don't over-engineer the map layer up front.
 - **Backend:** **Firebase** for email auth + multi-device sync (so installing on a
-  second device restores my data). Single user, but sync is wanted.
+  second device restores data). Single user, but sync is wanted.
 - **Local persistence:** on-device **SQLite** as the source of truth; Firebase
   syncs it.
 
@@ -55,19 +58,18 @@ difference is the whole point of the project.
    reminders.
 4. **Fuel diary** — fill-ups, mileage/efficiency calculations, cost tracking.
 5. **Telemetry / ride history** — distance, duration, map snapshot per ride.
-6. **Media controls** — now-playing overlaid onto our own video frame (not the
-   dash's native widget). Note: Android restricts answering/ending calls
-   programmatically — calls are realistically display + reject + alert only.
+6. **Media controls** — now-playing overlaid onto our own video frame. Note:
+   Android restricts answering/ending calls programmatically — calls are
+   realistically display + reject + alert only.
 
 ## Build phasing
 
-Sequenced so standalone, useful parts land first and the risky reverse-engineering
-is isolated:
+Sequenced so standalone, useful parts land first and the hardware-dependent dash
+link is isolated:
 
-1. **Phase 1:** Kotlin control plane + auth ported and validated against firmware
-   11.63 (stream a static test video to the dash to prove the protocol). In
-   parallel, the standalone features (maintenance log, fuel diary, telemetry) — no
-   dash dependency, usable day one.
+1. **Phase 1:** Kotlin link layer validated against firmware 11.63 (stream a static
+   test video to the dash). In parallel, the standalone features (maintenance log,
+   fuel diary, telemetry) — no dash dependency, usable day one.
 2. **Phase 2:** off-screen MapLibre/map → MediaCodec → dash with screen OFF. Proves
    the power fix.
 3. **Phase 3:** GPS + offline routing + turn-by-turn rendering.
@@ -76,11 +78,10 @@ is isolated:
 ## Hard constraints / non-goals
 
 - **Android only.** No iOS.
-- **One bike** (Himalayan 450), **one dash target** (RE Tripper). No generic
+- **One bike** (Himalayan 450), **one dash target** (Tripper). No generic
   multi-bike / multi-dash abstraction.
-- No personas, no branding-as-product, no team/lab infrastructure, no server-side
-  PostGIS unless a real need appears. Keep it lean.
-- The dash-streaming core requires **hardware-in-the-loop validation on my bike** —
+- No personas, no branding-as-product, no team/lab infrastructure. Keep it lean.
+- The dash-streaming core requires **hardware-in-the-loop validation on the bike** —
   that part can't be verified from code alone.
 
 ## Reference docs in this repo

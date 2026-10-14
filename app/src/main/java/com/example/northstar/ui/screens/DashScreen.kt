@@ -22,6 +22,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -38,6 +39,7 @@ import kotlinx.coroutines.delay
 @Composable
 fun DashScreen(vm: DashViewModel = viewModel()) {
     val ui by vm.ui.collectAsState()
+    val previewFrame by vm.previewFrame.collectAsState()
     val context = LocalContext.current
 
     // WiFi network request (13+: NEARBY_WIFI_DEVICES) + GPS for the map
@@ -61,11 +63,42 @@ fun DashScreen(vm: DashViewModel = viewModel()) {
         ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
     }
 
+    // Cross-OEM: is the app exempt from battery optimization? Without it, OxygenOS/One UI/MIUI/etc.
+    // kill the stream when the screen turns off. Re-checked on resume (the rider grants it in a
+    // system dialog and returns).
+    var batteryOk by remember {
+        mutableStateOf(com.example.northstar.util.DeviceReadiness.isIgnoringBatteryOptimizations(context))
+    }
+
+    // The battery-exemption system dialog, launched as the last step before connecting. Whatever
+    // the rider chooses, we re-check and continue the connect they started — no second button.
+    val batteryLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        batteryOk = com.example.northstar.util.DeviceReadiness.isIgnoringBatteryOptimizations(context)
+        vm.connect()
+    }
+
+    // Connect, but first ask for background activity (battery-optimization exemption) once if it's
+    // not already granted — folded into Connect so there's a single button. Remembered so we don't
+    // re-prompt on later connects.
+    fun connectWithBackgroundCheck() {
+        if (!batteryOk && !com.example.northstar.util.DeviceReadiness.batteryExemptionAsked(context)) {
+            com.example.northstar.util.DeviceReadiness.markBatteryExemptionAsked(context)
+            val launched = runCatching {
+                batteryLauncher.launch(com.example.northstar.util.DeviceReadiness.batteryExemptionIntent(context))
+            }.isSuccess
+            if (!launched) vm.connect()  // OEM without the standard dialog — connect anyway
+        } else {
+            vm.connect()
+        }
+    }
+
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
         val essentialOk = essentialPermissions.all { results[it] == true }
-        if (essentialOk) vm.connect()
+        if (essentialOk) connectWithBackgroundCheck()
     }
 
     // Local preview state (mirrors what the dash shows)
@@ -97,6 +130,12 @@ fun DashScreen(vm: DashViewModel = viewModel()) {
     }
 
     val streaming = ui.stage == ConnStage.STREAMING
+    // Tear the MapLibre map down the INSTANT a connection starts (Wi-Fi/auth), not at the streaming
+    // transition. Disposing MapLibre's native MapView (TextureView GL surface) at the same moment the
+    // MediaCodec encoder input Surface is created races the GL renderer thread's eglSwap on some OEMs
+    // (MIUI especially) → SIGABRT in libgui/libhwui (mbgl AndroidGLRenderableResource::swap). Disposing
+    // it seconds earlier, while connecting, lets the GL thread fully tear down before the encoder spins up.
+    val connectingOrLive = ui.stage == ConnStage.WIFI || ui.stage == ConnStage.AUTH || streaming
 
     // Auto-connect on opening the Dash screen, so the rider doesn't tap "Connect" every
     // ride — just open the app. Fires once; if the dash is off it errors out quietly and
@@ -111,6 +150,34 @@ fun DashScreen(vm: DashViewModel = viewModel()) {
         }
     }
 
+    // If the rider was prompted to turn Wi‑Fi on and comes back to the app with it now enabled
+    // (e.g. from the Wi‑Fi panel), retry the connection automatically — no second tap needed.
+    val uiState = rememberUpdatedState(ui)
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val obs = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                batteryOk = com.example.northstar.util.DeviceReadiness.isIgnoringBatteryOptimizations(context)
+                if (uiState.value.needsWifiOn &&
+                    (context.applicationContext.getSystemService(android.content.Context.WIFI_SERVICE)
+                        as android.net.wifi.WifiManager).isWifiEnabled &&
+                    hasEssentialPermissions()
+                ) {
+                    vm.connect()
+                }
+                // Came back with Location services now enabled → retry the pairing automatically.
+                if (uiState.value.needsLocationOn &&
+                    com.example.northstar.util.DeviceReadiness.locationServicesEnabled(context) &&
+                    hasEssentialPermissions()
+                ) {
+                    vm.connect()
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(obs)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -121,8 +188,15 @@ fun DashScreen(vm: DashViewModel = viewModel()) {
         ScreenHeader(
             eyebrow = "What the rider sees",
             title = "Dash view",
+            hint = "A live preview of the map sent to the dash. Tap Connect to join the bike's WiFi and stream — your phone screen can stay off.",
             trailing = {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (streaming && ui.gpsStatus != com.example.northstar.viewmodel.GpsStatus.GOOD) {
+                        NorthstarChip(
+                            if (ui.gpsStatus == com.example.northstar.viewmodel.GpsStatus.LOST) "GPS lost" else "GPS weak",
+                            if (ui.gpsStatus == com.example.northstar.viewmodel.GpsStatus.LOST) ChipTone.Alert else ChipTone.Warn,
+                        )
+                    }
                     if (streaming && ui.thermal != "OK") {
                         NorthstarChip(
                             ui.thermal,
@@ -152,19 +226,22 @@ fun DashScreen(vm: DashViewModel = viewModel()) {
                         Text(
                             when (ui.stage) {
                                 ConnStage.OFFLINE -> "Connect to Tripper Dash"
-                                ConnStage.WIFI    -> "Joining ${ui.ssid}…"
-                                ConnStage.AUTH    -> "Authenticating with dash…"
-                                ConnStage.ERROR   -> "Connection failed"
+                                ConnStage.WIFI    -> if (ui.ssid.isNotBlank()) "Joining ${ui.ssid}…" else "Finding your dash…"
+                                ConnStage.AUTH    -> if (ui.retryAttempt > 0) "Retrying handshake…" else "Pairing with dash…"
+                                ConnStage.ERROR   -> "Couldn't connect"
                                 ConnStage.STREAMING -> "Streaming"
                             },
                             color = TextHi, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
                         )
                         Text(
                             when (ui.stage) {
-                                ConnStage.OFFLINE -> "WiFi + handshake + stream, one tap"
+                                ConnStage.OFFLINE -> "Turn the dash on, stand near the bike, then tap Connect"
                                 ConnStage.WIFI    -> "Accept the system dialog if it appears"
-                                ConnStage.AUTH    -> "Handshaking with firmware 11.63…"
-                                ConnStage.ERROR   -> ui.errorMessage ?: "See Logcat tag DashSession"
+                                ConnStage.AUTH    -> if (ui.retryAttempt > 0)
+                                    "Handshake attempt ${ui.retryAttempt} of 4 — this is normal"
+                                    else "Securing the link to firmware 11.63…"
+                                ConnStage.ERROR   -> ui.errorMessage
+                                    ?: "Make sure the dash is on and you're beside the bike, then try again."
                                 ConnStage.STREAMING -> ""
                             },
                             color = if (ui.stage == ConnStage.ERROR) Warn else TextMid,
@@ -174,10 +251,33 @@ fun DashScreen(vm: DashViewModel = viewModel()) {
                     }
                     if (ui.stage == ConnStage.OFFLINE || ui.stage == ConnStage.ERROR) {
                         NorthstarBtn(
-                            "Connect",
+                            when {
+                                ui.needsWifiOn -> "Turn on Wi‑Fi"
+                                ui.needsLocationOn -> "Turn on Location"
+                                ui.stage == ConnStage.ERROR -> "Try again"
+                                else -> "Connect"
+                            },
                             onClick = {
-                                if (hasEssentialPermissions()) vm.connect()
-                                else permissionLauncher.launch(requestedPermissions)
+                                when {
+                                    // Android 10+ won't let us toggle Wi‑Fi — open the system Wi‑Fi
+                                    // panel (slide-up, stays in-app). connect() auto-retries on resume.
+                                    ui.needsWifiOn -> runCatching {
+                                        context.startActivity(
+                                            android.content.Intent(android.provider.Settings.Panel.ACTION_WIFI)
+                                        )
+                                    }
+                                    // Location services (master toggle) must be ON to resolve the dash
+                                    // SSID for the auth handshake on first pairing. Open the location
+                                    // settings; connect() auto-retries on resume.
+                                    ui.needsLocationOn -> runCatching {
+                                        context.startActivity(
+                                            android.content.Intent(android.provider.Settings.ACTION_LOCATION_SOURCE_SETTINGS)
+                                        )
+                                    }
+                                    // Connect handles the background-activity ask itself (single button).
+                                    hasEssentialPermissions() -> connectWithBackgroundCheck()
+                                    else -> permissionLauncher.launch(requestedPermissions)
+                                }
                             },
                             icon = NorthstarIcons.Wifi,
                             variant = BtnVariant.Primary,
@@ -209,6 +309,7 @@ fun DashScreen(vm: DashViewModel = viewModel()) {
             }
         }
 
+
         // Circular viewport with streaming aura
         Box(
             contentAlignment = Alignment.Center,
@@ -222,7 +323,9 @@ fun DashScreen(vm: DashViewModel = viewModel()) {
                         .background(Brush.radialGradient(listOf(GoldGlow, Color.Transparent), radius = 200f))
                 )
             }
-            // Real Google Maps, clipped to the round Tripper shape.
+            // Round Tripper viewport. While streaming we show the EXACT frame being encoded to
+            // the dash (same renderer → pixel-identical to the bike). Before connecting there's no
+            // dash frame yet, so we fall back to the live MapLibre map for route preview.
             Box(
                 modifier = Modifier
                     .size(272.dp)
@@ -230,14 +333,39 @@ fun DashScreen(vm: DashViewModel = viewModel()) {
                     .border(6.dp, Color(0xFF0D0F10), CircleShape)
                     .border(2.dp, Line2, CircleShape),
             ) {
-                NorthstarMap(
-                    riderLat = ui.riderLat,
-                    riderLng = ui.riderLng,
-                    dest = ui.destLatLng,
-                    routePoints = ui.routePoints,
-                    hasLocationPermission = hasEssentialPermissions(),
-                    modifier = Modifier.fillMaxSize(),
-                )
+                val dashFrame = previewFrame
+                when {
+                    streaming && dashFrame != null -> androidx.compose.foundation.Image(
+                        bitmap = dashFrame.asImageBitmap(),
+                        contentDescription = "Live dash frame",
+                        // The dash is round and shows the centred circle of the 526×300 frame;
+                        // Crop into the circular viewport reproduces exactly that.
+                        contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                    // Connecting OR streaming-before-first-frame: show a lightweight placeholder, NOT the
+                    // MapLibre map. MapLibre's native MapView is disposed as soon as connecting starts
+                    // (see [connectingOrLive]) so its GL/TextureView teardown finishes well before the
+                    // encoder's MediaCodec Surface is created — disposing it concurrently raced the GL
+                    // renderer thread and crashed the process (SIGSEGV/SIGABRT in libmaplibre/libgui).
+                    connectingOrLive -> Box(
+                        Modifier.fillMaxSize().background(Color(0xFF0B0D0E)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            "Preparing dash view…",
+                            color = TextLo, fontSize = 12.sp, fontFamily = GeistMonoFamily,
+                        )
+                    }
+                    else -> NorthstarMap(
+                        riderLat = ui.riderLat,
+                        riderLng = ui.riderLng,
+                        dest = ui.destLatLng,
+                        routePoints = ui.routePoints,
+                        hasLocationPermission = hasEssentialPermissions(),
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
             }
         }
 
