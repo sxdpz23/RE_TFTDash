@@ -1,4 +1,4 @@
-# Northstar
+# NaviSarthi
 
 Personal Android companion app for a **Royal Enfield Himalayan 450** motorcycle,
 designed to work with the bike's **Tripper** dash. Single user, Android-only,
@@ -13,7 +13,7 @@ open-sourced. No user personas, no client/enterprise concerns.
 ## Primary goal
 
 Low-power **navigation shown on the Tripper dash** (a small **round TFT display**)
-without cooking the phone. Northstar **renders the map off-screen and
+without cooking the phone. NaviSarthi **renders the map off-screen and
 hardware-encodes H.264**, so the phone screen can stay **OFF** during the ride.
 That single architectural choice — keeping the screen off — is the whole point of
 the project.
@@ -31,8 +31,8 @@ the project.
 
 ## Core user flow
 
-1. Share a destination from **Google Maps** into Northstar.
-2. Northstar previews the route, tap **Send to Dash**.
+1. Share a destination from **Google Maps** into NaviSarthi.
+2. NaviSarthi previews the route, tap **Send to Dash**.
 3. While riding, the dash shows the map; the bike's **physical joystick**
    pans/zooms. The phone screen stays off.
 

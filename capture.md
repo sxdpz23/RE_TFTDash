@@ -45,7 +45,7 @@ channel = dash → phone:`2002`** (filter `udp.dstport==2002 && ip.src==192.168.
 
 ### ★ EXIT-NAV teardown — FULLY ISOLATED (closes the "Open Gaps" item)
 From `exit_nav` (map up t78–107s; exit at ~107s). The complete app→dash close sequence the RE app
-sends, which Northstar omits (hence our dash hangs):
+sends, which NaviSarthi omits (hence our dash hangs):
 1. **`06 80` = `12`** — mode-set to back/exit (0x12 = the BACK code). Entry uses `06 80` = `0b`.
 2. **`06 05` = `aa` ×4** — projection-state heartbeat flips active→idle. (`06 05` runs ~1 Hz the whole
    session: value **`55` = actively projecting**, **`aa` = idle/transition**.)
@@ -61,21 +61,21 @@ Entry sequence (for symmetry): `05 17`=`aa`×2 → `06 0c`=`30` → `06 05`=`aa`
 - `09 04`/`09 06` (value `aa`) = per-frame decode-acks, not buttons.
 
 ### ⚠ Two conflicts to settle with one labelled press each
-1. **Zoom direction.** Your note: `0x13`=in, `0x14`=out. Northstar's current code + the old decompile
+1. **Zoom direction.** Your note: `0x13`=in, `0x14`=out. NaviSarthi's current code + the old decompile
    memory say the **opposite** (`0x14`=zoomIn, `0x13`=zoomOut). My `zoom` capture (`0b 13 13 14 14`)
    confirms 13 & 14 are the zoom pair but can't prove direction. **Do one labelled "zoom IN ×2" press
    to settle** before trusting it in code.
 2. **Album-art `05 40` chunking.** Your full-snaplen note (chunks ~`1001`/`300`, flag `0x01` non-final
    / `0xFF` final) **contradicts** the old snaplen-256 inference (≤190B/frag). The full capture is more
-   trustworthy → Northstar's existing ~1000-byte chunk may actually be **correct**. Reconcile in
+   trustworthy → NaviSarthi's existing ~1000-byte chunk may actually be **correct**. Reconcile in
    `dash_media_tlv_protocol` memory + `DashCommands.albumArtFrames` rather than "fixing" it to 190B.
 
-### CALL — RE has NO answer/reject; that's a Northstar-only feature
+### CALL — RE has NO answer/reject; that's a NaviSarthi-only feature
 **The official RE app cannot answer / reject / end calls — it is display-only.** So a RE capture will
 NEVER show "answer/reject codes": there is nothing to reverse-engineer here. Answering/ending is
-Northstar's own capability (`TelecomManager.acceptRingingCall` / `endCall` behind `ANSWER_PHONE_CALLS`).
+NaviSarthi's own capability (`TelecomManager.acceptRingingCall` / `endCall` behind `ANSWER_PHONE_CALLS`).
 What the `call` capture DOES show is only what the dash forwards while a call card is up: `09 00` codes
 `01/03/04` + a new `09 01` state sub-channel (`aaaa/aa55/0055` = dash ring/state). **We pick which
-forwarded code maps to answer vs reject ourselves and verify it live during a real Northstar-handled
+forwarded code maps to answer vs reject ourselves and verify it live during a real NaviSarthi-handled
 call** — do NOT wait for a "labelled RE answer/reject capture"; it can't exist. (No labelled capture
 target for call control.)

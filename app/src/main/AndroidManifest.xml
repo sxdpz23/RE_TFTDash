@@ -43,7 +43,7 @@
          Google cloud auto-backup and adb backup. Cross-device continuity for the syncable
          data is already handled by Firestore (see data/SyncRepository.kt). -->
     <application
-        android:name=".NorthstarApplication"
+        android:name=".NaviSarthiApplication"
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
@@ -51,7 +51,7 @@
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.Northstar">
+        android:theme="@style/Theme.NaviSarthi">
 
         <!-- Map is MapLibre + OpenFreeMap (keyless) — no Google Maps API key needed. -->
 
@@ -60,7 +60,7 @@
             android:exported="true"
             android:label="@string/app_name"
             android:launchMode="singleTask"
-            android:theme="@style/Theme.Northstar"
+            android:theme="@style/Theme.NaviSarthi"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -91,9 +91,9 @@
              and reads CATEGORY_CALL notifications (caller name → dash TLV 05 22). User must enable it
              once under Settings → Notification access; nothing is read until then. -->
         <service
-            android:name=".media.NorthstarNotificationListener"
+            android:name=".media.NaviSarthiNotificationListener"
             android:exported="false"
-            android:label="Northstar media &amp; calls"
+            android:label="NaviSarthi media &amp; calls"
             android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
             <intent-filter>
                 <action android:name="android.service.notification.NotificationListenerService" />
@@ -103,7 +103,7 @@
         <!-- Firebase Cloud Messaging receiver. Dormant unless a Firebase project is wired up
              (google-services.json) and a push arrives. -->
         <service
-            android:name=".data.NorthstarMessagingService"
+            android:name=".data.NaviSarthiMessagingService"
             android:exported="false">
             <intent-filter>
                 <action android:name="com.google.firebase.MESSAGING_EVENT" />

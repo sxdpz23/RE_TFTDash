@@ -29,7 +29,7 @@ rootProject.file("signing.properties").let { f ->
 val hasReleaseSigning = signingProps.getProperty("storeFile")?.let { File(it).exists() } == true
 
 android {
-    namespace = "com.example.northstar"
+    namespace = "com.example.navisarthi"
     compileSdk {
         version = release(36) {
             minorApiLevel = 1
@@ -37,17 +37,13 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.northstar.app"
-        // API 29 (Android 10) is the real floor: the dash link is built on WifiNetworkSpecifier
-        // + ConnectivityManager.requestNetwork(specifier), both added in API 29, and that IS the
-        // app. Below 29 the core feature can't run and the unguarded calls would crash, so we
-        // don't pretend to support it. Also makes the API-26 notification paths always safe.
-        minSdk = 29
+        applicationId = "com.navisarthi.app"
+        // NaviSarthi targets Android 14 and newer.
+        minSdk = 34
         targetSdk = 36
-        // 1.3.1 = hotfix for the MapLibre page-switch SIGSEGV that shipped in 1.3.0 (code 12).
-        // versionCode 13 > 12 so it installs in place as an update.
-        versionCode = 13
-        versionName = "1.3.1"
+        // Independent NaviSarthi version sequence.
+        versionCode = 2
+        versionName = "0.2.0-dev01"
 
         // Test-channel telemetry: ride/connection diagnostics upload to Firestore so logs can be
         // pulled remotely (no adb) while iterating on test builds. MUST be flipped to "false" for

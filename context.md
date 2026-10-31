@@ -1,11 +1,11 @@
-# Northstar — Master Context (for any agent)
+# NaviSarthi — Master Context (for any agent)
 
 > **READ THIS FIRST.** This is the single orientation doc for anyone (human or agent)
-> picking up work on Northstar. It records *where everything lives*, the hard
+> picking up work on NaviSarthi. It records *where everything lives*, the hard
 > constraints, the dash protocol, the capture/decompile assets, the build & release
 > machinery, and the current state. Pair it with `CLAUDE.md` (project charter) and the
 > auto-memory index at
-> `~/.claude/projects/-home-aditya-Work-repos-Northstar-Android/memory/MEMORY.md`.
+> `~/.claude/projects/-home-aditya-Work-repos-NaviSarthi-Android/memory/MEMORY.md`.
 >
 > **This file is LOCAL-ONLY.** Do not push it (see the no-push policy below). It
 > references the author's private reverse-engineering assets and signing keys.
@@ -14,21 +14,21 @@ Last updated: 2026-06-29 · App version at time of writing: **1.3.2 (versionCode
 
 ---
 
-## 0. What Northstar is (one paragraph)
+## 0. What NaviSarthi is (one paragraph)
 
 Personal Android companion app for a **Royal Enfield Himalayan 450** (now also pairs
 with **Guerrilla 450** and **Bear 650**) that streams **navigation to the bike's
-Tripper dash** (a small round TFT) over the dash's Wi-Fi. The whole point: Northstar
+Tripper dash** (a small round TFT) over the dash's Wi-Fi. The whole point: NaviSarthi
 renders the map **off-screen**, hardware-encodes **H.264**, and sends it as **RTP over
 UDP/5000** to the dash, so **the phone screen stays OFF** during the ride (no overheating
 — the official RE app screen-mirrors and cooks the phone). In-app branding is **"Sherpa"**;
-the project/package shell is **"Northstar"**. Independent project, not affiliated with RE.
+the project/package shell is **"NaviSarthi"**. Independent project, not affiliated with RE.
 
 ---
 
 ## 1. HARD CONSTRAINTS — read before doing anything
 
-1. **NEVER `git push` to `origin`.** The public repo `github.com/adityadasika21/NorthStar`
+1. **NEVER `git push` to `origin`.** The public repo `github.com/adityadasika21/NaviSarthi`
    is a user-base funnel; a competitor fork (`subtlesayak/open-dash`) is built on it and
    pulls the author's riders. Pushing feeds them. **Hard stop — do not push, do not offer to
    push, do not nag about unpushed commits.** Committing **locally** (on `play-release` or any
@@ -48,12 +48,12 @@ the project/package shell is **"Northstar"**. Independent project, not affiliate
 
 ## 2. Repository layout
 
-Working dir: `/home/aditya/Work/repos/Northstar Android` · git branch `play-release` (release
-line) · main branch `main`. Package `com.example.northstar` (namespace), applicationId
-`com.northstar.app`. minSdk **30** (Android 11), targetSdk 36, compileSdk 36.x, AGP 9.x,
+Working dir: `/home/aditya/Work/repos/NaviSarthi Android` · git branch `play-release` (release
+line) · main branch `main`. Package `com.example.navisarthi` (namespace), applicationId
+`com.navisarthi.app`. minSdk **30** (Android 11), targetSdk 36, compileSdk 36.x, AGP 9.x,
 Kotlin + Jetpack Compose + Material3, Navigation Compose (string routes).
 
-### Source tree — `app/src/main/java/com/example/northstar/`
+### Source tree — `app/src/main/java/com/example/navisarthi/`
 
 - **`dash/`** — dash link layer
   - `DashSocket.kt` — UDP sockets (control plane broadcast + RTP). `DashAuth.kt` — RSA auth
@@ -71,19 +71,19 @@ Kotlin + Jetpack Compose + Material3, Navigation Compose (string routes).
   - **`dash/protocol/`** — `K1GPacket.kt` (K1G TLV framing), `DashCommands.kt` (nav/media/call TLV builders).
   - **`dash/video/`** — `DashEncoder.kt` (MediaCodec H.264 Baseline, `requestKeyFrame()`),
     `NalProcessor.kt`, `RtpPacketizer.kt` (RFC 6184 single-NAL + FU-A).
-- **`data/`** — `NorthstarDb.kt` (SQLite source of truth), `SyncRepository.kt` (Firestore sync),
+- **`data/`** — `NaviSarthiDb.kt` (SQLite source of truth), `SyncRepository.kt` (Firestore sync),
   `FirebaseGate.kt`/`FirebaseFeatures.kt` (BYO-Firebase, all no-op if no `google-services.json`),
   `SettingsStore.kt` (autoConnect + useMiles), `Units.kt`, `GarageModels.kt`, `RideRecorder.kt`,
   `RideDiagnostics.kt`/`DiagnosticsUploader.kt` (debug-only remote diag), `UpdateChecker.kt`
   (in-app OTA via GitHub releases), `TestBuildChecker.kt`, `AuthPrefs.kt`, `SharedLocation.kt`,
-  `MaintenanceNotifier.kt`, `NorthstarMessagingService.kt` (FCM).
+  `MaintenanceNotifier.kt`, `NaviSarthiMessagingService.kt` (FCM).
 - **`media/`** — `MediaInfoProvider.kt` (now-playing via MediaSessionManager),
-  `CallInfoProvider.kt`, `NorthstarNotificationListener.kt` (notification access + caller name),
+  `CallInfoProvider.kt`, `NaviSarthiNotificationListener.kt` (notification access + caller name),
   `MediaModels.kt`. (CallController for joystick answer/reject lives here too when present.)
-- **`ui/`** — `NorthstarIcons.kt` (icon aliases + custom path vectors).
+- **`ui/`** — `NaviSarthiIcons.kt` (icon aliases + custom path vectors).
   - **`ui/theme/`** — `Color.kt`, `Theme.kt`, `Type.kt` (Geist via Downloadable Fonts).
     **Dark-only in 1.3.2 release** (theming reverted — see §8).
-  - **`ui/components/`** — `NorthstarComponents.kt`, `NorthstarMap.kt` (in-app MapLibre map),
+  - **`ui/components/`** — `NaviSarthiComponents.kt`, `NaviSarthiMap.kt` (in-app MapLibre map),
     `CircularDash.kt`, `Joystick.kt`, `BarChart.kt`, `UpdatePrompt.kt`.
   - **`ui/navigation/AppNavigation.kt`** — NavHost + bottom nav + update prompt root.
   - **`ui/screens/`** — Login, Home, Route, Dash, Garage, Rides, Settings.
@@ -144,12 +144,12 @@ route-card at ~1 Hz, or the destination watchdog tears the decoder down after ~1
   on any keyframe). Keyframes **front-loaded** at stream start (several IDRs ~0.25s apart in the
   first second so the dash locks on fast).
 - RE uses two profiles: High = **4 fps / 200 kbps**, Low = **2 fps / 100 kbps**; 30-frame
-  drop-oldest queue. Northstar runs **motion-adaptive** (250ms/200kbps moving, 500ms/100kbps
+  drop-oldest queue. NaviSarthi runs **motion-adaptive** (250ms/200kbps moving, 500ms/100kbps
   static, MOTION_HOLD_MS debounce) — gated on **motion**, NOT battery (deliberate, fits screen-off).
 - **Dash decoder is the smoothness ceiling (~8-12 fps; blinks above).** Smoothness comes from the
   **dead-reckoning predictor** interpolating between GPS fixes, not high stream fps.
 - **Video is intermittent in RE** — it stops streaming when the dash shows its own native
-  music/call/menu screens. Northstar streams continuously (a future power win to copy RE's
+  music/call/menu screens. NaviSarthi streams continuously (a future power win to copy RE's
   off-map stop).
 
 ### Joystick codes (verified on bike, fw 11.63) — TLV type `0x09` sub `0x00`, last byte = code
@@ -158,7 +158,7 @@ also forwards `0x13/0x14` (zoom out/in direct). **Mode-aware:** joystick is only
 **IN (0x18)** enters the dash's media-control mode; **NO map panning** — map joystick is zoom ±
 only; in media mode up/down=volume, left/right=prev/next track. Unmapped seen: `01 05 0b 15`.
 **Exit→menu gap:** RE on exit tells the dash to close the map and return to its Favorites menu;
-Northstar doesn't yet → map hangs / dash non-interactable after our session. (1.3.3 top fix.)
+NaviSarthi doesn't yet → map hangs / dash non-interactable after our session. (1.3.3 top fix.)
 
 ### Media / call TLVs (cracked from capture)
 - **`05 0d` now-playing:** three NUL-separated text fields ≤~19-20 chars (likely
@@ -168,14 +168,14 @@ Northstar doesn't yet → map hangs / dash non-interactable after our session. (
   flag `00`=first `01`=mid `ff`=last; reassemble by concatenating bytes after the 3-byte prefix
   across a `00 (01*) ff` run. **Residual unknown:** the 2-byte `b1b2` is content-dependent /
   per-fragment (rolling CRC or transfer id — ruled out: checksum/index/length). Resolve on
-  hardware. Northstar renders its own art so this is low priority.
+  hardware. NaviSarthi renders its own art so this is low priority.
 - **`05 01`** turn-by-turn instruction text. **`06 08`** projection keepalive. **`06 0b`** device name.
 - **`0x0C` telemetry (dash→app):** ~27 subfields (sub 0x01-0x26) but **all zero even with ignition
   on** — the Tripper does NOT forward instrument data to a projection client. Telemetry-into-app is
   **not feasible** over this link (would need OBD/CAN). Don't chase it.
 
 ### Dash-side reliability
-The dash Wi-Fi AP **hangs intermittently mid-ride** (dash-side bug, needs power-cycle). Northstar
+The dash Wi-Fi AP **hangs intermittently mid-ride** (dash-side bug, needs power-cycle). NaviSarthi
 has reconnect auto-recovery + a rider alert. Android-13 first-pairing auth fails if **Location
 services master toggle is OFF** — app prompts "Turn on Location".
 
@@ -226,7 +226,7 @@ monitor mode needed). `/system/bin/tcpdump` (4.99.4) is built into Nothing OS.
 This machine only has a JRE system-wide; Gradle's toolchain auto-detect picks a JRE without
 `jlink` → AGP `JdkImageTransform` fails. **Always point Gradle at the Adoptium JDK 21:**
 ```bash
-cd "/home/aditya/Work/repos/Northstar Android"
+cd "/home/aditya/Work/repos/NaviSarthi Android"
 JDK=/home/aditya/.gradle/jdks/eclipse_adoptium-21-amd64-linux.2
 JAVA_HOME="$JDK" PATH="$JDK/bin:$PATH" ./gradlew --no-daemon \
   -Dorg.gradle.java.installations.auto-detect=false -Dorg.gradle.java.home="$JDK" \
@@ -236,31 +236,31 @@ Use `--no-daemon`. No device/emulator attached here → only builds/lint/unit te
 Build tools (apksigner/aapt): `~/Android/Sdk/build-tools/37.0.0`. adb: `~/Android/Sdk/platform-tools/adb`.
 
 ### Two signing keys (both gitignored, both in `~/keystores/`)
-1. **Sideload key** — `northstar-release.jks`, alias `androiddebugkey`, creds in `signing.properties`
+1. **Sideload key** — `navisarthi-release.jks`, alias `androiddebugkey`, creds in `signing.properties`
    (repo root). Cert is **byte-identical to `~/.android/debug.keystore`**, signer SHA-256
    `ff42ba2e6d64e0c36e819aed298025002321b5dcd8aca75c7aee2f0a1dbdb00d` (SHA-1
    `80:30:BD:71:02:F2:9C:52:4D:C2:5E:0C:87:54:84:0D:2A:C9:2D:C8`). Used for the **GitHub/Obtainium/
    sideload channel** — every public APK shares one signature so updates install in place. **Play
    rejects this** (debug-signed). **GUARD THIS KEY** — losing it forces all users to reinstall.
-2. **Play upload key** — `northstar-upload.jks`, alias `northstar-upload`, creds in
-   `signing-upload.properties` (strong random pw), cert SHA-256 `37:38:49:D5…`, DN `CN=NorthStar,
-   O=NorthStar, C=IN`. For Play App Signing.
+2. **Play upload key** — `navisarthi-upload.jks`, alias `navisarthi-upload`, creds in
+   `signing-upload.properties` (strong random pw), cert SHA-256 `37:38:49:D5…`, DN `CN=NaviSarthi,
+   O=NaviSarthi, C=IN`. For Play App Signing.
 
 `app/build.gradle.kts` selects: pass **`-PplayUpload`** → upload key (`:app:bundleRelease` for the
 AAB); without the flag → sideload key (default). The two channels have different signatures → users
 can't cross-grade in place (they pick a channel). Release build is R8-minified, arm64-v8a only,
 `DIAG_UPLOAD=false`. Full runbook: `docs/RELEASE-internal-testing.md`.
 
-**OAuth note:** Google Sign-In requires the `(com.northstar.app + signing SHA-1)` pair registered as
+**OAuth note:** Google Sign-In requires the `(com.navisarthi.app + signing SHA-1)` pair registered as
 an Android OAuth 2.0 client in GCP/Firebase console (SHA-1 `80:30:BD:71…`). `UNREGISTERED_ON_API_CONSOLE`
 = that registration missing.
 
 ### Release process (binary-only GitHub release — preserves no-push)
 ```bash
-gh release create vX.Y.Z --title "Northstar vX.Y.Z" \
+gh release create vX.Y.Z --title "NaviSarthi vX.Y.Z" \
   --notes-file "version 1.3/CHANGELOG-X.Y.Z.md" \
   --target main \
-  /path/to/northstar-vX.Y.Z.apk
+  /path/to/navisarthi-vX.Y.Z.apk
 ```
 `--target main` anchors the tag at the **existing remote HEAD** → **no source pushed**, only the APK
 asset ships. (gh network calls may need per-command sandbox approval.) Auto-update for users =
@@ -271,11 +271,11 @@ contains a `sha256:` line → then checksum compare). Bump `versionCode` every r
 
 ## 6. Remote test/diagnostics loop (no adb needed)
 
-Firebase project **`northstar-c2625`** (note: diag/sync project also referenced as the app's
+Firebase project **`navisarthi-c2625`** (note: diag/sync project also referenced as the app's
 Firebase). Service account at `tools/firebase/serviceAccount.json` (gitignored).
 
 - **Push a test build:** `cd tools/firebase && node push-build.mjs <apk-path> "notes"` → uploads to
-  Storage `builds/northstar-test.apk` (fixed permalink) + writes Firestore `meta/test_build`
+  Storage `builds/navisarthi-test.apk` (fixed permalink) + writes Firestore `meta/test_build`
   (buildId + sha256). Phone installs via in-app "New test build" prompt. **Test builds are DEBUG**
   (`DIAG_UPLOAD=true` → ride logs upload; same debug key so they install over each other).
 - **Pull ride logs:** `node pull-diag.mjs [--since 1d]` → writes `tools/firebase/diag/<device>__ride-*.log`
@@ -355,14 +355,14 @@ rider QOL + open-dash garage data-entry parity. The exit→menu joystick gap (§
 
 ## 9. iOS port (separate repo — context only)
 
-Started 2026-06-26 at **`/home/aditya/Work/repos/northstar-ios`** (NOT in this tree; local git, no
+Started 2026-06-26 at **`/home/aditya/Work/repos/navisarthi-ios`** (NOT in this tree; local git, no
 remote). Parity target = Android 1.3.2 + RE per-bike themes. SwiftUI + a Foundation core. **Needs
-macOS + Xcode to build the UI** — Linux box can't compile that. The portable core (`NorthstarCore`:
+macOS + Xcode to build the UI** — Linux box can't compile that. The portable core (`NaviSarthiCore`:
 `K1GPacket.swift` + `RTPPacketizer.swift`) is **verified green on Linux** (5 tests pass, Swift 6.0.3,
 wire-compatible with the dash emulator) via `podman run --rm -v "$PWD":/src:Z -w /src swift:6.0 swift
 test`. Two hardware gates to prove before building out: (1) no-internet Wi-Fi auto-join to `RE_*` via
 NEHotspotConfiguration; (2) background H.264 encode with screen OFF (iOS suspends on lock — needs an
-approved background mode). Map: `northstar-ios/docs/STATUS.md`.
+approved background mode). Map: `navisarthi-ios/docs/STATUS.md`.
 
 ---
 
@@ -386,17 +386,17 @@ approved background mode). Map: `northstar-ios/docs/STATUS.md`.
 
 | What | Where |
 |---|---|
-| Repo | `/home/aditya/Work/repos/Northstar Android` (branch `play-release`) |
+| Repo | `/home/aditya/Work/repos/NaviSarthi Android` (branch `play-release`) |
 | Adoptium JDK 21 | `/home/aditya/.gradle/jdks/eclipse_adoptium-21-amd64-linux.2` |
 | Build tools | `~/Android/Sdk/build-tools/37.0.0` · adb `~/Android/Sdk/platform-tools/adb` |
-| Sideload key | `~/keystores/northstar-release.jks` (creds `signing.properties`) |
-| Play upload key | `~/keystores/northstar-upload.jks` (creds `signing-upload.properties`) |
+| Sideload key | `~/keystores/navisarthi-release.jks` (creds `signing.properties`) |
+| Play upload key | `~/keystores/navisarthi-upload.jks` (creds `signing-upload.properties`) |
 | Remote loop | `tools/firebase/{push-build,pull-diag,deploy-rules}.mjs` · SA `serviceAccount.json` |
 | Dash emulator | `tools/dash-emulator/` |
 | Capture pcaps | `~/ns_captures/` · scripts `~/ns_cap_*.sh`, `~/ns_capture_*.sh`, `~/ns_analyze_capture.sh` |
 | RE decompile | `~/ns_reverse/` (`FINDINGS.md`, `MEDIA_PROTOCOL.md`, `CAPTURE_PLAN.md`, `reprime_apk/`, `reprime_src/`) |
-| iOS port | `/home/aditya/Work/repos/northstar-ios` |
-| Auto-memory | `~/.claude/projects/-home-aditya-Work-repos-Northstar-Android/memory/MEMORY.md` |
+| iOS port | `/home/aditya/Work/repos/navisarthi-ios` |
+| Auto-memory | `~/.claude/projects/-home-aditya-Work-repos-NaviSarthi-Android/memory/MEMORY.md` |
 
 ---
 

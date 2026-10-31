@@ -1,6 +1,6 @@
 rules_version = '2';
 
-// Northstar sync model: local SQLite is the source of truth; every record is
+// NaviSarthi sync model: local SQLite is the source of truth; every record is
 // mirrored to Firestore under users/{uid}/… (see data/SyncRepository.kt).
 // A rider may only ever touch their own subtree — no cross-user reads/writes,
 // and nothing is readable while signed out.

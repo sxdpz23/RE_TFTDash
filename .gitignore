@@ -44,3 +44,7 @@ node_modules/
 
 # Machine-local Claude Code settings — not for the public repo.
 .claude/settings.local.json
+
+# Keep NaviSarthi milestone plans in source control.
+!/version plans/
+!/version plans/**
